@@ -2,8 +2,11 @@ use crate::protocol::{Effect, EffectOperation, ResourceRef, StateRef};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
+
+const MAX_STATE_REF_HASH_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Default, Clone)]
 pub struct EffectRecorder {
@@ -139,14 +142,71 @@ impl EffectRecorder {
 }
 
 pub fn state_ref_for_file(path: &Path) -> std::io::Result<StateRef> {
-    let bytes = fs::read(path)?;
+    let (mut file, bytes) = open_regular_file_no_follow(path)?;
+    if bytes > MAX_STATE_REF_HASH_BYTES {
+        let mut metadata = Map::<String, Value>::new();
+        metadata.insert("hashSkipped".to_string(), Value::Bool(true));
+        metadata.insert(
+            "hashLimitBytes".to_string(),
+            Value::Number(MAX_STATE_REF_HASH_BYTES.into()),
+        );
+        return Ok(StateRef {
+            hash: None,
+            bytes: Some(bytes),
+            content_ref: None,
+            snapshot_ref: None,
+            metadata,
+        });
+    }
+
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let bytes_read = file.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
     Ok(StateRef {
-        hash: Some(format!("sha256:{}", sha256_hex(&bytes))),
-        bytes: Some(bytes.len() as u64),
+        hash: Some(format!("sha256:{:x}", hasher.finalize())),
+        bytes: Some(bytes),
         content_ref: None,
         snapshot_ref: None,
         metadata: Map::<String, Value>::new(),
     })
+}
+
+#[cfg(unix)]
+fn open_regular_file_no_follow(path: &Path) -> std::io::Result<(fs::File, u64)> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "path is not a regular file",
+        ));
+    }
+    Ok((file, metadata.len()))
+}
+
+#[cfg(not(unix))]
+fn open_regular_file_no_follow(path: &Path) -> std::io::Result<(fs::File, u64)> {
+    let file = fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "path is not a regular file",
+        ));
+    }
+    Ok((file, metadata.len()))
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -172,4 +232,27 @@ pub fn temp_file_path(target: &Path) -> PathBuf {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(file_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn state_ref_rejects_symlink_without_following_it() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let outside = temp.path().join("outside.txt");
+        let link = temp.path().join("link.txt");
+        fs::write(&outside, "outside secret").unwrap();
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let err = state_ref_for_file(&link).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Too many levels of symbolic links")
+                || err.to_string().contains("path is not a regular file")
+        );
+    }
 }

@@ -26,7 +26,7 @@ The standalone Rust workspace owns:
 - Session creation, attachment, closure, and destruction.
 - Workspace root resolution and `/workspace` logical path mapping.
 - Tool invocation execution.
-- Policy enforcement for filesystem, process, network, and environment access.
+- Policy enforcement for filesystem, process, and environment access.
 - Effect recording.
 - Worker protocol for pull-based execution.
 - HTTP and Unix socket host transports.
@@ -46,7 +46,7 @@ It does not own:
 The foundational crate. It has no HTTP or broker coupling. It owns protocol
 types, session lifecycle, workspace resolution, effect recording, and primitive
 tool implementations. The Rust tool surface mirrors the current built-in
-tool names: `Read`, `Write`, `Edit`, `Glob`, `Grep`, and `Bash`.
+tool names: `Read`, `Write`, `Edit`, `List`, `Glob`, `Grep`, and `Bash`.
 
 `executioner-host`
 
@@ -110,6 +110,22 @@ The worker abstractions are lease-shaped. `FileBroker` moves requests through:
 pending -> claimed -> completed | failed
 ```
 
+Malformed pending files and files with invalid invocation ids are quarantined
+under `rejected` so one bad local file cannot stop a worker from claiming later
+valid work. Worker ids are validated before claiming and must be ASCII
+identifier strings containing only letters, numbers, `_`, and `-`.
+
+The file-backed broker atomically moves a pending file into a private claiming
+file before parsing it, then writes the claimed envelope only after validation.
+That keeps concurrent local workers from claiming the same pending file.
+Completed and failed events must echo the claimed `attemptId` and `leaseToken`;
+stale or forged worker results are rejected.
+Invocation ids are single-use across pending, claimed, completed, and failed
+states in the file-backed broker.
+Workers also verify that host results match the claimed invocation and session
+before completing the claim; mismatches are recorded as failed invocations for
+the original claim.
+
 Production brokers should preserve the same claim/lease shape rather than
 passively subscribing. A lease allows the system to retry abandoned work without
 allowing two workers to execute the same mutation concurrently.
@@ -124,7 +140,8 @@ Examples:
 - `file.write` for a workbook file changed on disk.
 - `artifact.updated` for a generated report artifact.
 - `process.exec` for a shell command.
-- `network.request` for an outbound request when network is enabled.
+- `network.request` for a future mediated outbound request. Network mediation is
+  not implemented yet, so sessions must keep network policy disabled.
 
 Effects are not the same as success or failure. A failed process can still write
 a file before exiting. A successful read can have no durable effects.

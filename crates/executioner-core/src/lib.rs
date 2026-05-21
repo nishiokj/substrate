@@ -1,3 +1,4 @@
+pub mod artifact;
 pub mod effects;
 pub mod error;
 pub mod host;

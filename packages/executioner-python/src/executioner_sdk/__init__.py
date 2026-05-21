@@ -7,13 +7,17 @@ from .environment import (
     NetworkPolicyConfig,
     PolicyConfig,
     ProcessPolicyConfig,
+    ResourceRef,
     SessionInfo,
     StateEffect,
     SubmitResult,
     ToolCall,
     ToolSubmitOptions,
     WorkerConfig,
+    WorkspaceArtifact,
+    WorkspaceArtifactEntry,
     WorkspaceConfig,
+    materialize_workspace_artifact,
 )
 
 __all__ = [
@@ -25,11 +29,15 @@ __all__ = [
     "NetworkPolicyConfig",
     "PolicyConfig",
     "ProcessPolicyConfig",
+    "ResourceRef",
     "SessionInfo",
     "StateEffect",
     "SubmitResult",
     "ToolCall",
     "ToolSubmitOptions",
     "WorkerConfig",
+    "WorkspaceArtifact",
+    "WorkspaceArtifactEntry",
     "WorkspaceConfig",
+    "materialize_workspace_artifact",
 ]

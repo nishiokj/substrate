@@ -41,12 +41,24 @@ Substrate currently exposes a small built-in tool surface:
 - `Read`
 - `Write`
 - `Edit`
+- `List`
 - `Glob`
 - `Grep`
 - `Bash`
 
-The host executes local filesystem/process tools directly. Control-plane and
-agent-memory tools are intentionally outside the execution substrate.
+The host executes local filesystem/process tools directly. `Bash` is disabled
+by default, and enabling it also requires a non-empty `allowedCommands` process
+policy. Command-name allowlist entries reject shell control syntax and obvious
+host-path escapes such as absolute paths, parent-directory paths, and escaped or
+quoted shell fragments; exact full-command entries are treated as deliberate
+trust decisions. Path-like arguments are resolved through the workspace
+resolver, so symlink escapes are rejected. `process.maxProcesses` is accepted
+only as a non-negative `u32`-sized count. Bash also starts with an empty environment:
+host variables are copied only when listed in `env.allowlist`, injected values
+come from `env.injected`, and `env.denylist` wins over both. Bash duration is
+capped by the minimum of tool `timeout`, invocation `timeoutMs`, and
+`policy.maxDurationMs`. Control-plane and agent-memory tools are intentionally
+outside the execution substrate.
 
 ## Try It
 
@@ -77,6 +89,22 @@ cargo run -p executioner -- invoke \
   --tool Write \
   --args-json '{"path":"hello.txt","content":"hello"}'
 ```
+
+Export the current workspace to an artifact:
+
+```sh
+cargo run -p executioner -- session export \
+  --host-url http://127.0.0.1:8765 \
+  --session-id sess_...
+```
+
+The Rust, TypeScript, and Python SDKs can also materialize a verified workspace
+artifact into a new empty destination. The TypeScript SDK exposes artifact
+export with `env.exportWorkspace()` and materialization with
+`env.materializeWorkspaceArtifact(...)`.
+SDKs expose `list(cwd=...)` / `list({ cwd })` helpers for one-level directory
+listings, with `list_files(cwd=...)` / `listFiles({ cwd })` kept as explicit
+aliases. These helpers delegate to the built-in `List` tool.
 
 Run a worker daemon against a file-backed queue and a remote or local host:
 

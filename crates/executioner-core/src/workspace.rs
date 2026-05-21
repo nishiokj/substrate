@@ -22,8 +22,10 @@ pub enum AccessKind {
 
 impl WorkspaceResolver {
     pub fn for_session(session: &Session) -> Result<Self> {
+        let root = PathBuf::from(&session.workspace.root);
+        ensure_workspace_root_is_still_safe(&root)?;
         Ok(Self {
-            root: PathBuf::from(&session.workspace.root).canonicalize()?,
+            root: root.canonicalize()?,
             policy: session.policy.clone(),
         })
     }
@@ -97,7 +99,39 @@ impl WorkspaceResolver {
         })
     }
 
+    pub fn resolve_readable_cwd(&self, cwd: Option<&str>) -> Result<ResolvedPath> {
+        let resolved = self.resolve_cwd(cwd)?;
+        self.ensure_policy(AccessKind::Read, &resolved.logical_path)?;
+        Ok(resolved)
+    }
+
+    pub fn resolve_writable_cwd(&self, cwd: Option<&str>) -> Result<ResolvedPath> {
+        let resolved = self.resolve_cwd(cwd)?;
+        self.ensure_policy(AccessKind::Write, &resolved.logical_path)?;
+        Ok(resolved)
+    }
+
+    pub fn ensure_existing_parent_for_write(&self, path: &Path) -> Result<()> {
+        let parent = path.parent().ok_or_else(|| {
+            ExecutionerError::InvalidRequest("write target has no parent".to_string())
+        })?;
+        let canonical_parent = parent.canonicalize()?;
+        self.ensure_under_workspace(&canonical_parent)?;
+        let logical_parent = self.host_to_logical(&canonical_parent)?;
+        self.ensure_policy(AccessKind::Write, &logical_parent)
+    }
+
+    pub fn ensure_parent_allowed_for_write(&self, path: &Path) -> Result<()> {
+        let parent = path.parent().ok_or_else(|| {
+            ExecutionerError::InvalidRequest("write target has no parent".to_string())
+        })?;
+        self.ensure_under_workspace(parent)?;
+        let logical_parent = self.host_to_logical_unchecked(parent)?;
+        self.ensure_policy(AccessKind::Write, &logical_parent)
+    }
+
     fn logical_to_host(&self, cwd: Option<&str>, requested: &str) -> Result<PathBuf> {
+        validate_logical_path_text(requested)?;
         if requested.trim().is_empty() {
             return Err(ExecutionerError::InvalidRequest(
                 "path is required".to_string(),
@@ -105,7 +139,10 @@ impl WorkspaceResolver {
         }
 
         let base = match cwd {
-            Some(cwd) if !cwd.trim().is_empty() => self.path_from_logical(cwd)?,
+            Some(cwd) if !cwd.trim().is_empty() => {
+                validate_logical_path_text(cwd)?;
+                self.path_from_logical(cwd)?
+            }
             _ => self.root.clone(),
         };
 
@@ -124,6 +161,7 @@ impl WorkspaceResolver {
     }
 
     fn path_from_logical(&self, logical: &str) -> Result<PathBuf> {
+        validate_logical_path_text(logical)?;
         if logical == "/workspace" {
             return Ok(self.root.clone());
         }
@@ -181,6 +219,83 @@ impl WorkspaceResolver {
     }
 }
 
+fn validate_logical_path_text(path: &str) -> Result<()> {
+    if path.contains('\0') {
+        return Err(ExecutionerError::InvalidRequest(
+            "path contains invalid NUL byte".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_policy_roots(label: &str, roots: &[String]) -> Result<()> {
+    for root in roots {
+        validate_policy_root(label, root)?;
+    }
+    Ok(())
+}
+
+fn validate_policy_root(label: &str, root: &str) -> Result<()> {
+    validate_logical_path_text(root)?;
+    let trimmed = root.trim_end_matches('/');
+    if trimmed.is_empty()
+        || !(trimmed == "/workspace" || trimmed.starts_with("/workspace/"))
+        || trimmed
+            .split('/')
+            .any(|component| component == "." || component == "..")
+    {
+        return Err(ExecutionerError::InvalidRequest(format!(
+            "{label} entries must be /workspace logical roots without . or .. components"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_workspace_root_is_still_safe(root: &Path) -> Result<()> {
+    let parent = root.parent().unwrap_or_else(|| Path::new("."));
+    ensure_path_parent_has_no_symlinks(parent, "workspace.root parent")?;
+    let metadata = root.symlink_metadata().map_err(ExecutionerError::Io)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ExecutionerError::InvalidRequest(
+            "workspace.root must be a real directory".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_path_parent_has_no_symlinks(parent: &Path, label: &str) -> Result<()> {
+    let mut current = if parent.is_absolute() {
+        parent.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(parent)
+    };
+    loop {
+        match current.symlink_metadata() {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                if is_platform_root_symlink(&current) {
+                    if !current.pop() {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                return Err(ExecutionerError::InvalidRequest(format!(
+                    "{label} must not contain symlinks"
+                )));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+        if !current.pop() {
+            return Ok(());
+        }
+    }
+}
+
+fn is_platform_root_symlink(path: &Path) -> bool {
+    matches!(path.to_str(), Some("/var" | "/tmp" | "/etc"))
+}
+
 fn nearest_existing_parent(path: &Path) -> Result<PathBuf> {
     let mut current = path.to_path_buf();
     loop {
@@ -197,8 +312,19 @@ fn nearest_existing_parent(path: &Path) -> Result<PathBuf> {
 }
 
 fn logical_is_under(path: &str, root: &str) -> bool {
-    let root = root.trim_end_matches('/');
+    let Some(root) = normalize_policy_root(root) else {
+        return false;
+    };
     path == root || path.starts_with(&format!("{root}/"))
+}
+
+fn normalize_policy_root(root: &str) -> Option<&str> {
+    let root = root.trim_end_matches('/');
+    if root == "/workspace" || root.starts_with("/workspace/") {
+        Some(root)
+    } else {
+        None
+    }
 }
 
 fn normalize_lexically(path: &Path) -> Result<PathBuf> {

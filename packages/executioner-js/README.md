@@ -23,6 +23,10 @@ const edit = await env.edit({
   newString: 'hello from Executioner',
 });
 
+const files = await env.list({ cwd: '/workspace' });
+const artifact = await env.exportWorkspace();
+await env.materializeWorkspaceArtifact(artifact, '/tmp/restored-workspace');
+
 await env.close();
 ```
 
