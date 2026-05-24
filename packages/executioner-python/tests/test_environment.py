@@ -16,7 +16,7 @@ from urllib import error as urlerror
 from urllib import request as urlrequest
 from unittest.mock import patch
 
-from executioner_sdk import ExecutionerEnvironment
+from executioner_sdk import Environment, Executioner, ExecutionerEnvironment, tool, tool_schemas
 from executioner_sdk.environment import (
     ResourceRef,
     SessionInfo,
@@ -52,6 +52,118 @@ def executioner_binary() -> str:
 
 
 class ExecutionerEnvironmentTests(unittest.TestCase):
+    def test_environment_alias_points_to_friendly_facade(self) -> None:
+        self.assertIs(Environment, Executioner)
+
+    def test_tool_helper_builds_tool_call_envelope(self) -> None:
+        self.assertEqual(
+            tool("Write", path="notes.txt", content="hello"),
+            {
+                "toolName": "Write",
+                "arguments": {"path": "notes.txt", "content": "hello"},
+            },
+        )
+
+    def test_tool_schemas_expose_builtin_tools(self) -> None:
+        schemas = tool_schemas()
+        self.assertIn("Read", [schema["name"] for schema in schemas])
+        self.assertIn("Bash", [schema["name"] for schema in schemas])
+        read_schema = next(schema for schema in schemas if schema["name"] == "Read")
+        self.assertEqual(read_schema["input_schema"]["required"], ["path"])
+
+    def test_friendly_executioner_create_lowers_to_environment_config(self) -> None:
+        sentinel = object()
+        with patch.object(ExecutionerEnvironment, "create", return_value=sentinel) as create:
+            env = Executioner.create(
+                workspace=Path("/tmp/substrate-demo"),
+                host="http://127.0.0.1:8765/api",
+                allow_commands=["python", "pytest"],
+                env={"TOKEN": "secret"},
+                lifecycle={"destroyOnClose": False},
+                binary_path="/bin/executioner",
+                submit_timeout_ms=1234,
+                advanced={"worker": {"kind": "external"}},
+            )
+
+        self.assertIs(env, sentinel)
+        create.assert_called_once()
+        kwargs = create.call_args.kwargs
+        self.assertEqual(kwargs["binaryPath"], "/bin/executioner")
+        self.assertEqual(kwargs["host"], {"kind": "http", "baseUrl": "http://127.0.0.1:8765/api"})
+        self.assertEqual(kwargs["worker"], {"kind": "external"})
+        self.assertEqual(
+            kwargs["workspace"],
+            {"kind": "existing", "root": str(Path("/tmp/substrate-demo").resolve())},
+        )
+        self.assertEqual(kwargs["lifecycle"], {"destroyOnClose": False})
+        self.assertEqual(kwargs["submitTimeoutMs"], 1234)
+        self.assertEqual(
+            kwargs["policy"],
+            {
+                "process": {
+                    "allowExec": True,
+                    "allowedCommands": ["python", "pytest"],
+                },
+                "env": {"injected": {"TOKEN": "secret"}},
+            },
+        )
+
+    def test_execute_accepts_agent_tool_call_shapes(self) -> None:
+        config = _RuntimeConfig(
+            binaryPath="executioner",
+            queueDir="/tmp/queue",
+            sdkCreatedQueueDir=False,
+            sdkCreatedStateDir=False,
+            baseUrl="http://127.0.0.1:1/",
+            host={"kind": "http", "baseUrl": "http://127.0.0.1:1/"},
+            worker={"kind": "external"},
+            workspace={"kind": "new"},
+            policy={},
+            lifecycle={"destroyOnClose": True, "cleanupQueueOnClose": False, "cleanupStateOnClose": False},
+            submitTimeoutMs=30_000,
+        )
+        session = SessionInfo.from_json({
+            "id": "sess",
+            "state": "ready",
+            "workspace": {
+                "root": "/tmp/workspace",
+                "logicalRoot": "/workspace",
+                "mode": "new",
+                "fresh": True,
+                "managed": True,
+            },
+            "createdAt": "now",
+            "metadata": {},
+        })
+        env = ExecutionerEnvironment(config, session, [])
+
+        submitted: list[dict[str, object]] = []
+
+        def fake_submit(call: dict[str, object]) -> SubmitResult:
+            submitted.append(call)
+            return SubmitResult.from_json({
+                "invocationId": "inv",
+                "sessionId": "sess",
+                "toolName": call["toolName"],
+                "status": "success",
+                "output": "ok",
+                "error": None,
+                "summary": None,
+                "effects": [],
+                "durationMs": 1,
+                "metadata": {},
+            })
+
+        with patch.object(env, "submit", side_effect=fake_submit):
+            result = env.execute({"id": "call_1", "name": "Read", "input": {"path": "notes.txt"}})
+
+        self.assertEqual(result.output, "ok")
+        self.assertEqual(submitted, [{
+            "toolName": "Read",
+            "arguments": {"path": "notes.txt"},
+            "metadata": {"toolCallId": "call_1"},
+        }])
+
     def test_rejects_invalid_session_id_before_url_construction(self) -> None:
         with self.assertRaisesRegex(ValueError, "invalid session id"):
             _assert_session_id("../escaped")

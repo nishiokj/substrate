@@ -15,7 +15,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal, Mapping, TypedDict
+from typing import Any, Literal, Mapping, TypedDict, Union
 from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
@@ -266,6 +266,12 @@ class ToolCall(TypedDict, total=False):
     metadata: dict[str, Any]
 
 
+class ToolSchema(TypedDict):
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+
+
 class ToolSubmitOptions(TypedDict, total=False):
     cwd: str
     invocationId: str
@@ -279,6 +285,132 @@ class EditToolArguments(TypedDict, total=False):
     oldString: str
     newString: str
     replaceAll: bool
+
+
+_TOOL_SCHEMAS: tuple[ToolSchema, ...] = (
+    {
+        "name": "Read",
+        "description": "Read a UTF-8 text file from the workspace.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Workspace-relative or /workspace path to read."},
+                "maxBytes": {"type": "integer", "minimum": 1},
+                "startLine": {"type": "integer", "minimum": 1},
+                "endLine": {"type": "integer", "minimum": 1},
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "Write",
+        "description": "Create a new UTF-8 text file in the workspace.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "content": {"type": "string"},
+            },
+            "required": ["path", "content"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "Edit",
+        "description": "Replace text in an existing workspace file.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "oldString": {"type": "string"},
+                "newString": {"type": "string"},
+                "replaceAll": {"type": "boolean"},
+            },
+            "required": ["path", "oldString", "newString"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "List",
+        "description": "List entries in the current workspace directory.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "Glob",
+        "description": "Find workspace files whose relative paths match a glob pattern.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string"},
+                "maxResults": {"type": "integer", "minimum": 1},
+                "maxDepth": {"type": "integer", "minimum": 1},
+                "includeHidden": {"type": "boolean"},
+            },
+            "required": ["pattern"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "Grep",
+        "description": "Search workspace files for a regular expression.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string"},
+                "caseSensitive": {"type": "boolean"},
+                "maxResults": {"type": "integer", "minimum": 1},
+                "path": {"type": "string"},
+                "glob": {"type": "string"},
+                "type": {"type": "string"},
+            },
+            "required": ["pattern"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "Bash",
+        "description": "Run a shell command allowed by the session policy inside the workspace.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string"},
+                "timeout": {"type": "integer", "minimum": 1},
+            },
+            "required": ["command"],
+            "additionalProperties": False,
+        },
+    },
+)
+
+
+FriendlyWorkspace = Union[Literal["new"], str, os.PathLike[str]]
+FriendlyHost = Union[Literal["local"], str, HostConfig]
+
+
+def tool(name: str, **arguments: Any) -> ToolCall:
+    """Create a tool call without exposing the wire envelope shape."""
+    if not isinstance(name, str) or not name:
+        raise TypeError("tool name must be a non-empty string")
+    return {
+        "toolName": name,
+        "arguments": dict(arguments),
+    }
+
+
+def tool_schemas() -> list[ToolSchema]:
+    return [
+        {
+            "name": schema["name"],
+            "description": schema["description"],
+            "input_schema": dict(schema["input_schema"]),
+        }
+        for schema in _TOOL_SCHEMAS
+    ]
 
 
 @dataclass(frozen=True)
@@ -695,6 +827,13 @@ class ExecutionerEnvironment:
             tool_name=tool_name,
         )
 
+    def execute(self, tool_call: Mapping[str, Any]) -> SubmitResult:
+        normalized = _normalize_agent_tool_call(tool_call)
+        return self.submit(normalized)
+
+    def tool_schemas(self) -> list[ToolSchema]:
+        return tool_schemas()
+
     def edit(self, args: EditToolArguments, options: ToolSubmitOptions | None = None) -> SubmitResult:
         call: ToolCall = {
             **(options or {}),
@@ -702,6 +841,57 @@ class ExecutionerEnvironment:
             "arguments": dict(args),
         }
         return self.submit(call)
+
+    def submit_tool(
+        self,
+        name: str,
+        *,
+        cwd: str = "/workspace",
+        timeout_ms: int | None = None,
+        max_output_bytes: int | None = None,
+        metadata: dict[str, Any] | None = None,
+        **arguments: Any,
+    ) -> SubmitResult:
+        call: ToolCall = {
+            "toolName": name,
+            "arguments": dict(arguments),
+            "cwd": cwd,
+        }
+        if timeout_ms is not None:
+            call["timeoutMs"] = timeout_ms
+        if max_output_bytes is not None:
+            call["maxOutputBytes"] = max_output_bytes
+        if metadata is not None:
+            call["metadata"] = metadata
+        return self.submit(call)
+
+    def read(self, path: str | os.PathLike[str], *, cwd: str = "/workspace") -> str:
+        return self.submit_tool("Read", cwd=cwd, path=os.fspath(path)).output
+
+    def write(
+        self,
+        path: str | os.PathLike[str],
+        content: str,
+        *,
+        cwd: str = "/workspace",
+    ) -> SubmitResult:
+        return self.submit_tool("Write", cwd=cwd, path=os.fspath(path), content=content)
+
+    def bash(
+        self,
+        command: str,
+        *,
+        cwd: str = "/workspace",
+        timeout_ms: int | None = None,
+        max_output_bytes: int | None = None,
+    ) -> str:
+        return self.submit_tool(
+            "Bash",
+            cwd=cwd,
+            timeout_ms=timeout_ms,
+            max_output_bytes=max_output_bytes,
+            command=command,
+        ).output
 
     def list_files(self, cwd: str = "/workspace") -> list[str]:
         result = self.submit({
@@ -762,6 +952,120 @@ class ExecutionerEnvironment:
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         self.close()
+
+
+class Executioner:
+    """Friendly SDK facade for creating local or remote execution environments."""
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        workspace: FriendlyWorkspace | WorkspaceConfig = "new",
+        host: FriendlyHost = "local",
+        allow_commands: list[str] | None = None,
+        env: Mapping[str, str] | None = None,
+        policy: PolicyConfig | None = None,
+        lifecycle: LifecycleConfig | None = None,
+        binary_path: str | None = None,
+        submit_timeout_ms: int | None = None,
+        advanced: Mapping[str, Any] | None = None,
+    ) -> ExecutionerEnvironment:
+        advanced_config = dict(advanced or {})
+        _reject_unknown_fields(
+            advanced_config,
+            {"backend", "worker", "binaryPath", "binary_path", "submitTimeoutMs", "submit_timeout_ms"},
+            "advanced",
+        )
+        return ExecutionerEnvironment.create(
+            binaryPath=(
+                binary_path
+                or advanced_config.get("binaryPath")
+                or advanced_config.get("binary_path")
+            ),
+            backend=advanced_config.get("backend"),
+            host=_friendly_host(host),
+            worker=advanced_config.get("worker"),
+            workspace=_friendly_workspace(workspace),
+            policy=_friendly_policy(policy, allow_commands=allow_commands, env=env),
+            lifecycle=lifecycle,
+            submitTimeoutMs=(
+                submit_timeout_ms
+                or advanced_config.get("submitTimeoutMs")
+                or advanced_config.get("submit_timeout_ms")
+            ),
+        )
+
+
+Environment = Executioner
+
+
+def _friendly_workspace(workspace: FriendlyWorkspace | WorkspaceConfig) -> WorkspaceConfig:
+    if isinstance(workspace, Mapping):
+        return dict(workspace)  # type: ignore[return-value]
+    if workspace == "new":
+        return {"kind": "new"}
+    return {
+        "kind": "existing",
+        "root": str(Path(os.fspath(workspace)).expanduser().resolve()),
+    }
+
+
+def _friendly_host(host: FriendlyHost) -> HostConfig:
+    if isinstance(host, Mapping):
+        return dict(host)  # type: ignore[return-value]
+    if host == "local":
+        return {"kind": "managed"}
+    if isinstance(host, str) and (host.startswith("http://") or host.startswith("https://")):
+        return {"kind": "http", "baseUrl": host}
+    raise ValueError("host must be 'local', an HTTP(S) URL, or a host config object")
+
+
+def _friendly_policy(
+    policy: PolicyConfig | None,
+    *,
+    allow_commands: list[str] | None,
+    env: Mapping[str, str] | None,
+) -> PolicyConfig | None:
+    if policy is None and allow_commands is None and env is None:
+        return None
+
+    resolved: dict[str, Any] = dict(policy or {})
+    for nested_key in ("process", "network", "env"):
+        if isinstance(resolved.get(nested_key), Mapping):
+            resolved[nested_key] = dict(resolved[nested_key])
+
+    if allow_commands is not None:
+        process = dict(resolved.get("process", {}))
+        process["allowExec"] = True
+        process["allowedCommands"] = list(allow_commands)
+        resolved["process"] = process
+
+    if env is not None:
+        env_policy = dict(resolved.get("env", {}))
+        injected = dict(env_policy.get("injected", {}))
+        injected.update(dict(env))
+        env_policy["injected"] = injected
+        resolved["env"] = env_policy
+
+    return resolved  # type: ignore[return-value]
+
+
+def _normalize_agent_tool_call(tool_call: Mapping[str, Any]) -> ToolCall:
+    call = _json_mapping(tool_call, "agent tool call")
+    name = call.get("toolName", call.get("name"))
+    if not isinstance(name, str) or not name:
+        raise TypeError("agent tool call name must be a non-empty string")
+    arguments = call.get("arguments", call.get("args", call.get("input", {})))
+    if not isinstance(arguments, dict):
+        raise TypeError("agent tool call input must be a JSON object")
+    normalized: ToolCall = {
+        "toolName": name,
+        "arguments": dict(arguments),
+    }
+    if isinstance(call.get("id"), str):
+        normalized["metadata"] = {"toolCallId": call["id"]}
+    return normalized
 
 
 def _cleanup_partial_create(

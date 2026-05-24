@@ -27,6 +27,8 @@ export type WorkspaceConfig =
   | { kind: 'new' }
   | { kind: 'existing'; root: string };
 
+export type FriendlyWorkspace = 'new' | string | WorkspaceConfig;
+
 export type WorkerConfig =
   | { kind: 'managed'; id?: string; idleSleepMs?: number }
   | { kind: 'external' };
@@ -34,6 +36,8 @@ export type WorkerConfig =
 export type HostConfig =
   | { kind: 'managed'; stateDir?: string; host?: string; port?: number }
   | { kind: 'http'; baseUrl: string };
+
+export type FriendlyHost = 'local' | string | HostConfig;
 
 export type BackendConfig = {
   kind: 'file';
@@ -86,6 +90,23 @@ export type EnvironmentConfig = {
   submitTimeoutMs?: number;
 };
 
+export type ExecutionerConfig = {
+  workspace?: FriendlyWorkspace;
+  host?: FriendlyHost;
+  allowCommands?: string[];
+  env?: Record<string, string>;
+  policy?: PolicyConfig;
+  lifecycle?: LifecycleConfig;
+  binaryPath?: string;
+  submitTimeoutMs?: number;
+  advanced?: {
+    backend?: BackendConfig;
+    worker?: WorkerConfig;
+    binaryPath?: string;
+    submitTimeoutMs?: number;
+  };
+};
+
 export type ToolCall = {
   toolName: string;
   arguments: Record<string, unknown>;
@@ -94,6 +115,21 @@ export type ToolCall = {
   timeoutMs?: number;
   maxOutputBytes?: number;
   metadata?: Record<string, unknown>;
+};
+
+export type AgentToolCall = {
+  id?: string;
+  name?: string;
+  toolName?: string;
+  input?: Record<string, unknown>;
+  args?: Record<string, unknown>;
+  arguments?: Record<string, unknown>;
+};
+
+export type ToolSchema = {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
 };
 
 export type ToolSubmitOptions = Omit<ToolCall, 'toolName' | 'arguments'>;
@@ -220,6 +256,168 @@ type ManagedProcess = {
   name: string;
 };
 
+const TOOL_SCHEMAS: readonly ToolSchema[] = [
+  {
+    name: 'Read',
+    description: 'Read a UTF-8 text file from the workspace.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Workspace-relative or /workspace path to read.' },
+        maxBytes: { type: 'integer', minimum: 1 },
+        startLine: { type: 'integer', minimum: 1 },
+        endLine: { type: 'integer', minimum: 1 },
+      },
+      required: ['path'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'Write',
+    description: 'Create a new UTF-8 text file in the workspace.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string' },
+        content: { type: 'string' },
+      },
+      required: ['path', 'content'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'Edit',
+    description: 'Replace text in an existing workspace file.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string' },
+        oldString: { type: 'string' },
+        newString: { type: 'string' },
+        replaceAll: { type: 'boolean' },
+      },
+      required: ['path', 'oldString', 'newString'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'List',
+    description: 'List entries in the current workspace directory.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'Glob',
+    description: 'Find workspace files whose relative paths match a glob pattern.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string' },
+        maxResults: { type: 'integer', minimum: 1 },
+        maxDepth: { type: 'integer', minimum: 1 },
+        includeHidden: { type: 'boolean' },
+      },
+      required: ['pattern'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'Grep',
+    description: 'Search workspace files for a regular expression.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string' },
+        caseSensitive: { type: 'boolean' },
+        maxResults: { type: 'integer', minimum: 1 },
+        path: { type: 'string' },
+        glob: { type: 'string' },
+        type: { type: 'string' },
+      },
+      required: ['pattern'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'Bash',
+    description: 'Run a shell command allowed by the session policy inside the workspace.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        command: { type: 'string' },
+        timeout: { type: 'integer', minimum: 1 },
+      },
+      required: ['command'],
+      additionalProperties: false,
+    },
+  },
+];
+
+export function toolSchemas(): ToolSchema[] {
+  return TOOL_SCHEMAS.map((schema) => ({
+    name: schema.name,
+    description: schema.description,
+    inputSchema: { ...schema.inputSchema },
+  }));
+}
+
+export function tool(
+  toolName: string,
+  args: Record<string, unknown> = {},
+  options: ToolSubmitOptions = {},
+): ToolCall {
+  assertToolName(toolName);
+  assertObject(args, 'tool arguments');
+  return {
+    ...options,
+    toolName,
+    arguments: { ...args },
+  };
+}
+
+export class Executioner {
+  static async create(config: ExecutionerConfig = {}): Promise<ExecutionerEnvironment> {
+    const configObject = jsonObject(config, 'executioner config') as ExecutionerConfig;
+    rejectUnknownFields(configObject, [
+      'workspace',
+      'host',
+      'allowCommands',
+      'env',
+      'policy',
+      'lifecycle',
+      'binaryPath',
+      'submitTimeoutMs',
+      'advanced',
+    ], 'executioner config');
+    const advanced = configObject.advanced === undefined
+      ? {}
+      : jsonObject(configObject.advanced, 'advanced config') as NonNullable<ExecutionerConfig['advanced']>;
+    rejectUnknownFields(advanced, [
+      'backend',
+      'worker',
+      'binaryPath',
+      'submitTimeoutMs',
+    ], 'advanced config');
+
+    return ExecutionerEnvironment.create({
+      binaryPath: configObject.binaryPath ?? advanced.binaryPath,
+      backend: advanced.backend,
+      host: friendlyHost(configObject.host ?? 'local'),
+      worker: advanced.worker,
+      workspace: friendlyWorkspace(configObject.workspace ?? 'new'),
+      policy: friendlyPolicy(configObject.policy, {
+        allowCommands: configObject.allowCommands,
+        env: configObject.env,
+      }),
+      lifecycle: configObject.lifecycle,
+      submitTimeoutMs: configObject.submitTimeoutMs ?? advanced.submitTimeoutMs,
+    });
+  }
+}
+
 export class ExecutionerEnvironment {
   private constructor(
     private readonly config: RequiredRuntimeConfig,
@@ -331,12 +529,45 @@ export class ExecutionerEnvironment {
     );
   }
 
+  async execute(toolCall: AgentToolCall): Promise<SubmitResult> {
+    return this.submit(normalizeAgentToolCall(toolCall));
+  }
+
+  toolSchemas(): ToolSchema[] {
+    return toolSchemas();
+  }
+
   async edit(args: EditToolArguments, options: ToolSubmitOptions = {}): Promise<SubmitResult> {
     return this.submit({
       ...options,
       toolName: 'Edit',
       arguments: { ...args },
     });
+  }
+
+  async submitTool(
+    toolName: string,
+    args: Record<string, unknown> = {},
+    options: ToolSubmitOptions = {},
+  ): Promise<SubmitResult> {
+    return this.submit(tool(toolName, args, {
+      cwd: '/workspace',
+      ...options,
+    }));
+  }
+
+  async read(path: string, options: ToolSubmitOptions = {}): Promise<string> {
+    const result = await this.submitTool('Read', { path }, options);
+    return result.output;
+  }
+
+  async write(path: string, content: string, options: ToolSubmitOptions = {}): Promise<SubmitResult> {
+    return this.submitTool('Write', { path, content }, options);
+  }
+
+  async bash(command: string, options: ToolSubmitOptions = {}): Promise<string> {
+    const result = await this.submitTool('Bash', { command }, options);
+    return result.output;
   }
 
   async listFiles(options: ListFilesOptions = {}): Promise<string[]> {
@@ -397,6 +628,8 @@ export class ExecutionerEnvironment {
     return session;
   }
 }
+
+export const Environment = Executioner;
 
 export async function materializeWorkspaceArtifact(
   artifact: WorkspaceArtifact,
@@ -489,6 +722,87 @@ type RequiredPolicyConfig = {
   maxDurationMs: number;
   maxOutputBytes: number;
 };
+
+function friendlyWorkspace(workspace: FriendlyWorkspace): WorkspaceConfig {
+  if (typeof workspace === 'object') {
+    return workspace;
+  }
+  if (workspace === 'new') {
+    return { kind: 'new' };
+  }
+  return {
+    kind: 'existing',
+    root: resolve(workspace),
+  };
+}
+
+function friendlyHost(host: FriendlyHost): HostConfig {
+  if (typeof host === 'object') {
+    return host;
+  }
+  if (host === 'local') {
+    return { kind: 'managed' };
+  }
+  if (host.startsWith('http://') || host.startsWith('https://')) {
+    return { kind: 'http', baseUrl: host };
+  }
+  throw new Error("host must be 'local', an HTTP(S) URL, or a host config object");
+}
+
+function friendlyPolicy(
+  policy: PolicyConfig | undefined,
+  options: { allowCommands?: string[]; env?: Record<string, string> },
+): PolicyConfig | undefined {
+  if (policy === undefined && options.allowCommands === undefined && options.env === undefined) {
+    return undefined;
+  }
+
+  const resolved: PolicyConfig = {
+    ...policy,
+    process: policy?.process === undefined ? undefined : { ...policy.process },
+    network: policy?.network === undefined ? undefined : { ...policy.network },
+    env: policy?.env === undefined ? undefined : {
+      ...policy.env,
+      injected: policy.env.injected === undefined ? undefined : { ...policy.env.injected },
+    },
+  };
+
+  if (options.allowCommands !== undefined) {
+    resolved.process = {
+      ...resolved.process,
+      allowExec: true,
+      allowedCommands: [...options.allowCommands],
+    };
+  }
+
+  if (options.env !== undefined) {
+    resolved.env = {
+      ...resolved.env,
+      injected: {
+        ...resolved.env?.injected,
+        ...options.env,
+      },
+    };
+  }
+
+  return resolved;
+}
+
+function normalizeAgentToolCall(toolCall: AgentToolCall): ToolCall {
+  const call = jsonObject(toolCall, 'agent tool call') as AgentToolCall;
+  const toolName = call.toolName ?? call.name;
+  assertToolName(toolName);
+  const args = call.arguments ?? call.args ?? call.input ?? {};
+  assertObject(args, 'agent tool call input');
+  const normalized: ToolCall = {
+    toolName,
+    arguments: { ...args },
+  };
+  if (typeof call.id === 'string') {
+    normalized.metadata = { toolCallId: call.id };
+  }
+  return normalized;
+}
 
 async function materializeConfig(config: EnvironmentConfig): Promise<RequiredRuntimeConfig> {
   const configObject = jsonObject(config, 'environment config') as EnvironmentConfig;

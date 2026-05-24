@@ -6,8 +6,12 @@ import { EventEmitter } from 'node:events';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
+  Executioner,
   ExecutionerEnvironment,
+  Environment,
   materializeWorkspaceArtifact,
+  tool,
+  toolSchemas,
   type LifecycleConfig,
   type ListFilesOptions,
   type PolicyConfig,
@@ -28,6 +32,115 @@ afterEach(async () => {
 });
 
 describe('ExecutionerEnvironment file queue validation', () => {
+  test('Environment alias points to friendly facade', () => {
+    expect(Environment).toBe(Executioner);
+  });
+
+  test('tool helper builds tool call envelope', () => {
+    expect(tool('Write', { path: 'notes.txt', content: 'hello' })).toEqual({
+      toolName: 'Write',
+      arguments: { path: 'notes.txt', content: 'hello' },
+    });
+  });
+
+  test('toolSchemas expose built-in tools', () => {
+    const schemas = toolSchemas();
+    expect(schemas.map((schema) => schema.name)).toContain('Read');
+    expect(schemas.map((schema) => schema.name)).toContain('Bash');
+    expect(schemas.find((schema) => schema.name === 'Read')?.inputSchema).toMatchObject({
+      required: ['path'],
+    });
+  });
+
+  test('friendly Executioner.create lowers to environment config', async () => {
+    const originalCreate = ExecutionerEnvironment.create;
+    const calls: unknown[] = [];
+    const sentinel = {};
+    (ExecutionerEnvironment as unknown as { create: (config: unknown) => Promise<unknown> }).create = async (config: unknown) => {
+      calls.push(config);
+      return sentinel;
+    };
+    try {
+      const env = await Executioner.create({
+        workspace: '/tmp/substrate-demo',
+        host: 'http://127.0.0.1:8765/api',
+        allowCommands: ['python', 'pytest'],
+        env: { TOKEN: 'secret' },
+        lifecycle: { destroyOnClose: false },
+        binaryPath: '/bin/executioner',
+        submitTimeoutMs: 1234,
+        advanced: { worker: { kind: 'external' } },
+      });
+
+      expect(env).toBe(sentinel as ExecutionerEnvironment);
+      expect(calls).toEqual([{
+        binaryPath: '/bin/executioner',
+        backend: undefined,
+        host: { kind: 'http', baseUrl: 'http://127.0.0.1:8765/api' },
+        worker: { kind: 'external' },
+        workspace: { kind: 'existing', root: '/tmp/substrate-demo' },
+        policy: {
+          process: {
+            allowExec: true,
+            allowedCommands: ['python', 'pytest'],
+          },
+          env: { injected: { TOKEN: 'secret' } },
+        },
+        lifecycle: { destroyOnClose: false },
+        submitTimeoutMs: 1234,
+      }]);
+    } finally {
+      (ExecutionerEnvironment as unknown as { create: typeof originalCreate }).create = originalCreate;
+    }
+  });
+
+  test('execute accepts agent tool call shapes', async () => {
+    const env = new (ExecutionerEnvironment as unknown as new (
+      config: unknown,
+      session: unknown,
+      processes: unknown[],
+    ) => ExecutionerEnvironment)(
+      {
+        queueDir: '/tmp/queue',
+        submitTimeoutMs: 30_000,
+      },
+      {
+        id: 'sess',
+      },
+      [],
+    );
+    const calls: unknown[] = [];
+    const originalSubmit = env.submit;
+    env.submit = async (call: ToolCall) => {
+      calls.push(call);
+      return {
+        invocationId: 'inv',
+        sessionId: 'sess',
+        toolName: call.toolName,
+        status: 'success',
+        output: 'ok',
+        effects: [],
+        durationMs: 1,
+        metadata: {},
+      };
+    };
+    try {
+      const result = await env.execute({
+        id: 'call_1',
+        name: 'Read',
+        input: { path: 'notes.txt' },
+      });
+      expect(result.output).toBe('ok');
+      expect(calls).toEqual([{
+        toolName: 'Read',
+        arguments: { path: 'notes.txt' },
+        metadata: { toolCallId: 'call_1' },
+      }]);
+    } finally {
+      env.submit = originalSubmit;
+    }
+  });
+
   test('create rejects malformed config values before spawning processes', async () => {
     await expect(ExecutionerEnvironment.create({
       host: { kind: 'http', baseUrl: 'http://127.0.0.1:1/' },

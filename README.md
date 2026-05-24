@@ -24,7 +24,8 @@ The agent adapter is a consumer of this protocol, not the owner of it.
 - `packages/executioner-python`: Python SDK that manages host, session,
   worker, and file-backed queue lifecycle.
 - `docs/`: architecture and lifecycle notes.
-- `examples/`: JSON requests for manual testing.
+- `examples/`: minimal SDK and agent-loop samples, plus JSON requests for
+  manual testing.
 
 ## Core Invariant
 
@@ -61,6 +62,43 @@ capped by the minimum of tool `timeout`, invocation `timeoutMs`, and
 outside the execution substrate.
 
 ## Try It
+
+Minimal SDK usage:
+
+```py
+from substrate import Executioner
+
+with Executioner.create(workspace="new", allow_commands=["ls"]) as env:
+    env.write("notes.txt", "hello")
+    print(env.read("notes.txt"))
+    print(env.bash("ls /workspace"))
+```
+
+Minimal agent-loop shape:
+
+```py
+from anthropic import Anthropic
+from substrate import Executioner
+
+client = Anthropic()
+messages = [{"role": "user", "content": "Create notes.txt and read it back."}]
+
+with Executioner.create(workspace="new", allow_commands=["python", "pytest"]) as env:
+    response = client.messages.create(
+        model="...",
+        max_tokens=1024,
+        tools=env.tool_schemas(),
+        messages=messages,
+    )
+
+    for block in response.content:
+        if block.type == "tool_use":
+            result = env.execute({
+                "id": block.id,
+                "name": block.name,
+                "input": block.input,
+            })
+```
 
 Run tests:
 

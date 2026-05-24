@@ -33,6 +33,56 @@ protocol structs as its primary interface. Protocol structs remain owned by
 `executioner-core` and are used at transport, persistence, and schema
 boundaries.
 
+## Agent Loop Shape
+
+Agent SDKs usually emit a tool-use object with a tool name and JSON input. If
+the model sees Substrate's tool schemas, the environment can execute that object
+directly:
+
+```ts
+const client = new Anthropic();
+const env = await Executioner.create({ workspace: "new" });
+const tools = env.toolSchemas().map((schema) => ({
+    name: schema.name,
+    description: schema.description,
+    input_schema: schema.inputSchema,
+}));
+
+const response = await client.messages.create({
+    model,
+    max_tokens: 1024,
+    tools,
+    messages,
+});
+
+for (const block of response.content) {
+    if (block.type !== "tool_use") continue;
+    const result = await env.execute(block);
+    messages.push({
+        role: "user",
+        content: [{
+            type: "tool_result",
+            tool_use_id: block.id,
+            content: result.output,
+        }],
+    });
+}
+```
+
+If an application wants domain-specific tool names or schemas, it can map those
+calls manually while still using the environment as the execution authority:
+
+```ts
+if (toolUse.name === "read_project_file") {
+    const result = await env.read(toolUse.input.path);
+    await agent.sendToolResult(toolUse.id, result);
+}
+```
+
+That keeps the SDK small: schema export and execution for Substrate's own tools,
+manual mapping for custom tool vocabularies, and no binding DSL until repeated
+integration code proves one is needed.
+
 ## Worker Modes
 
 The environment supports three worker shapes:
