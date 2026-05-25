@@ -220,9 +220,20 @@ class HostConfig(TypedDict, total=False):
     baseUrl: str
 
 
+class AttachedHostConfig(TypedDict):
+    kind: Literal["http"]
+    baseUrl: str
+
+
 class BackendConfig(TypedDict, total=False):
     kind: BackendKind
     queueDir: str
+
+
+class AttachedEnvironmentConfig(TypedDict, total=False):
+    host: AttachedHostConfig
+    environmentId: str
+    submitTimeoutMs: int
 
 
 class LifecycleConfig(TypedDict, total=False):
@@ -713,7 +724,7 @@ class _ManagedProcess:
 @dataclass
 class _RuntimeConfig:
     binaryPath: str
-    queueDir: str
+    queueDir: str | None
     sdkCreatedQueueDir: bool
     sdkCreatedStateDir: bool
     baseUrl: str
@@ -723,6 +734,7 @@ class _RuntimeConfig:
     policy: dict[str, Any]
     lifecycle: dict[str, bool]
     submitTimeoutMs: int
+    transport: dict[str, Any] = field(default_factory=lambda: {"kind": "file"})
 
 
 class ExecutionerEnvironment:
@@ -731,10 +743,12 @@ class ExecutionerEnvironment:
         config: _RuntimeConfig,
         environment: EnvironmentInfo,
         processes: list[_ManagedProcess],
+        owns_environment: bool = True,
     ) -> None:
         self._config = config
         self._environment = environment
         self._processes = processes
+        self._owns_environment = owns_environment
 
     @classmethod
     def create(
@@ -779,7 +793,8 @@ class ExecutionerEnvironment:
                 )
                 _wait_for_health(runtime.baseUrl, runtime.submitTimeoutMs)
 
-            _ensure_file_queue(runtime.queueDir)
+            queue_dir = _required_queue_dir(runtime)
+            _ensure_file_queue(queue_dir)
             environment = _create_environment(runtime)
 
             if runtime.worker["kind"] == "managed":
@@ -794,7 +809,7 @@ class ExecutionerEnvironment:
                             "--host-url",
                             runtime.baseUrl,
                             "--queue-dir",
-                            runtime.queueDir,
+                            queue_dir,
                             "--idle-sleep-ms",
                             str(runtime.worker["idleSleepMs"]),
                         ],
@@ -802,10 +817,42 @@ class ExecutionerEnvironment:
                     )
                 )
 
-            return cls(runtime, environment, processes)
+            return cls(runtime, environment, processes, owns_environment=True)
         except Exception:
             _cleanup_partial_create(runtime, processes, environment)
             raise
+
+    @classmethod
+    def attach(
+        cls,
+        *,
+        host: AttachedHostConfig,
+        environmentId: str,
+        submitTimeoutMs: int | None = None,
+    ) -> "ExecutionerEnvironment":
+        host_config = _json_mapping(host, "host")
+        _reject_unknown_fields(host_config, {"kind", "baseUrl"}, "host")
+        _require_kind(host_config.get("kind"), "host.kind", ("http",))
+        environment_id = _json_non_empty_string(environmentId, "environmentId")
+        _assert_environment_id(environment_id)
+        base_url = _normalize_base_url(_json_non_empty_string(host_config.get("baseUrl"), "host.baseUrl"))
+        environment = EnvironmentInfo.from_json(_get_json(f"{base_url}environments/{environment_id}"))
+        _assert_environment_id(environment.id)
+        runtime = _RuntimeConfig(
+            binaryPath="",
+            queueDir=None,
+            sdkCreatedQueueDir=False,
+            sdkCreatedStateDir=False,
+            baseUrl=base_url,
+            host={"kind": "http", "baseUrl": base_url},
+            worker={"kind": "external"},
+            workspace={"kind": "new"},
+            policy=_materialize_policy(None),
+            lifecycle={"destroyOnClose": False, "cleanupQueueOnClose": False, "cleanupStateOnClose": False},
+            submitTimeoutMs=_json_positive_int(submitTimeoutMs, "submitTimeoutMs") if submitTimeoutMs is not None else 30_000,
+            transport={"kind": "direct"},
+        )
+        return cls(runtime, environment, [], owns_environment=False)
 
     @property
     def environment(self) -> EnvironmentInfo:
@@ -844,17 +891,20 @@ class ExecutionerEnvironment:
             _terminate_process(managed)
 
         try:
-            if self._config.lifecycle["destroyOnClose"]:
+            if not self._owns_environment:
+                environment = self._environment
+            elif self._config.lifecycle["destroyOnClose"]:
                 environment_data = _delete_json(f"{self._config.baseUrl}environments/{self._environment.id}")
+                environment = EnvironmentInfo.from_json(environment_data)
             else:
                 environment_data = _post_json(f"{self._config.baseUrl}environments/{self._environment.id}/close", None)
-            environment = EnvironmentInfo.from_json(environment_data)
+                environment = EnvironmentInfo.from_json(environment_data)
         finally:
             for managed in reversed(host_processes):
                 _terminate_process(managed)
 
             if self._config.lifecycle["cleanupQueueOnClose"]:
-                _cleanup_queue_dir(self._config.queueDir, self._config.sdkCreatedQueueDir)
+                _cleanup_queue_dir(_required_queue_dir(self._config), self._config.sdkCreatedQueueDir)
             if self._config.lifecycle["cleanupStateOnClose"] and self._config.host["kind"] == "managed":
                 _cleanup_state_dir(self._config.host["stateDir"], self._config.sdkCreatedStateDir)
 
@@ -915,11 +965,17 @@ class ExecutionerSession:
             "metadata": metadata,
         }
         _assert_serialized_json_size("tool invocation request", request, _MAX_REQUEST_JSON_BYTES)
-        _ensure_file_queue(self._config.queueDir)
-        _ensure_invocation_id_unused(self._config.queueDir, invocation_id)
-        _write_json_atomic(Path(self._config.queueDir) / "pending" / f"{invocation_id}.json", request)
+        if self._config.transport["kind"] == "direct":
+            return SubmitResult.from_json(
+                _post_json(f"{self._config.baseUrl}sessions/{self._session.id}/invocations", request)
+            )
+
+        queue_dir = _required_queue_dir(self._config)
+        _ensure_file_queue(queue_dir)
+        _ensure_invocation_id_unused(queue_dir, invocation_id)
+        _write_json_atomic(Path(queue_dir) / "pending" / f"{invocation_id}.json", request)
         return _wait_for_result(
-            self._config.queueDir,
+            queue_dir,
             invocation_id,
             self._session.id,
             self._config.submitTimeoutMs,
@@ -1053,7 +1109,7 @@ def _cleanup_partial_create(
         for managed in reversed(host_processes):
             _terminate_process(managed)
     if runtime.lifecycle["cleanupQueueOnClose"]:
-        _cleanup_queue_dir(runtime.queueDir, runtime.sdkCreatedQueueDir)
+        _cleanup_queue_dir(_required_queue_dir(runtime), runtime.sdkCreatedQueueDir)
     if runtime.lifecycle["cleanupStateOnClose"] and runtime.host["kind"] == "managed":
         _cleanup_state_dir(runtime.host["stateDir"], runtime.sdkCreatedStateDir)
 
@@ -1154,7 +1210,18 @@ def _materialize_config(
         policy=resolved_policy,
         lifecycle=resolved_lifecycle,
         submitTimeoutMs=_json_positive_int(submit_timeout_ms, "submitTimeoutMs") if submit_timeout_ms is not None else 30_000,
+        transport={"kind": "file", "queueDir": queue_dir},
     )
+
+
+def _required_queue_dir(config: _RuntimeConfig) -> str:
+    if config.transport.get("kind") == "file":
+        queue_dir = config.transport.get("queueDir")
+        if isinstance(queue_dir, str):
+            return queue_dir
+    if config.queueDir is not None:
+        return config.queueDir
+    raise RuntimeError("Executioner environment has no file queue")
 
 
 def _materialize_policy(policy: PolicyConfig | None) -> dict[str, Any]:
@@ -1763,6 +1830,10 @@ def _post_json(url: str, body: Any) -> dict[str, Any]:
         headers={"content-type": "application/json"},
     )
     return _request_json(request)
+
+
+def _get_json(url: str) -> dict[str, Any]:
+    return _request_json(urlrequest.Request(url, method="GET"))
 
 
 def _delete_json(url: str) -> dict[str, Any]:

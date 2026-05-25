@@ -106,6 +106,13 @@ Both use the same internal backend and host traits. The public facade does not
 hand agent applications a `FileBroker`, `HttpHostClient`, or queue directory
 API.
 
+When another client needs to join an existing live environment, use
+`ExecutionerEnvironment.attach(...)`. Attached handles create their own sessions
+under the environment and submit directly to the host, but they do not close or
+destroy the environment when the SDK handle is closed. The host serializes tool
+execution per environment, so many sessions share the same mutable workspace as
+one ordered stream.
+
 An external worker can also be started with the CLI:
 
 ```sh

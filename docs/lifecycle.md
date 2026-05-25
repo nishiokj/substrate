@@ -13,6 +13,14 @@ sessions and deletes the managed workspace. New sessions are always created
 inside an existing environment; there is no session-create shortcut that
 implicitly creates or owns an environment.
 
+Multiple clients may create sessions against the same live environment. The
+host treats the environment as the mutable workspace authority: invocations from
+different sessions are accepted concurrently at the API boundary, but tool
+execution is serialized per environment so filesystem mutations observe a
+single ordered stream. While an invocation is active or waiting for that
+environment execution lane, session close/destroy and environment close/destroy
+fail closed with an active-invocation error instead of racing workspace cleanup.
+
 ```mermaid
 stateDiagram-v2
     [*] --> starting
@@ -180,6 +188,12 @@ SDK close first stops managed workers, then closes or destroys the environment,
 and only then applies queue or state-directory cleanup. That order avoids a
 managed worker processing queued work against an environment that is already
 being destroyed.
+
+SDK-created environments own their local worker and file-broker lifecycle.
+Attached environment handles do not own the environment: they fetch the existing
+environment from the host, create sessions under it, submit invocations directly
+to `POST /sessions/:sessionId/invocations`, and `close()` only releases the SDK
+handle.
 
 Workspace cleanup and queue cleanup are separate. A managed `new` workspace is
 owned by the host environment lifecycle. A file-backed broker queue is owned by the

@@ -90,6 +90,12 @@ export type EnvironmentConfig = {
   submitTimeoutMs?: number;
 };
 
+export type AttachedEnvironmentConfig = {
+  host: { kind: 'http'; baseUrl: string };
+  environmentId: string;
+  submitTimeoutMs?: number;
+};
+
 export type ToolCall = {
   toolName: string;
   arguments: Record<string, unknown>;
@@ -387,6 +393,7 @@ export class ExecutionerEnvironment {
     private readonly config: RequiredRuntimeConfig,
     private readonly environmentInfo: EnvironmentInfo,
     private readonly processes: ManagedProcess[],
+    private readonly ownsEnvironment: boolean = true,
   ) {}
 
   static async create(config: EnvironmentConfig = {}): Promise<ExecutionerEnvironment> {
@@ -410,7 +417,8 @@ export class ExecutionerEnvironment {
         ]);
       }
 
-      await ensureFileQueue(runtime.queueDir);
+      const queueDir = requiredQueueDir(runtime);
+      await ensureFileQueue(queueDir);
 
       environment = await createEnvironment(runtime);
 
@@ -423,7 +431,7 @@ export class ExecutionerEnvironment {
           '--host-url',
           runtime.baseUrl,
           '--queue-dir',
-          runtime.queueDir,
+          queueDir,
           '--idle-sleep-ms',
           String(runtime.worker.idleSleepMs),
         ], 'executioner-worker');
@@ -431,11 +439,46 @@ export class ExecutionerEnvironment {
         await waitForManagedProcessStartup(workerProcess);
       }
 
-      return new ExecutionerEnvironment(runtime, environment, processes);
+      return new ExecutionerEnvironment(runtime, environment, processes, true);
     } catch (error) {
       await cleanupPartialCreate(runtime, processes, environment);
       throw error;
     }
+  }
+
+  static async attach(config: AttachedEnvironmentConfig): Promise<ExecutionerEnvironment> {
+    const configObject = jsonObject(config, 'attached environment config') as AttachedEnvironmentConfig;
+    rejectUnknownFields(configObject, ['host', 'environmentId', 'submitTimeoutMs'], 'attached environment config');
+    const host = jsonObject(configObject.host, 'host') as AttachedEnvironmentConfig['host'];
+    rejectUnknownFields(host, ['kind', 'baseUrl'], 'host');
+    requireKind(host.kind, 'host.kind', ['http']);
+    const environmentId = nonEmptyString(configObject.environmentId, 'environmentId');
+    assertEnvironmentId(environmentId);
+    const baseUrl = normalizeBaseUrl(nonEmptyString(host.baseUrl, 'host.baseUrl'));
+    const submitTimeoutMs = configObject.submitTimeoutMs === undefined
+      ? 30_000
+      : jsonPositiveInteger(configObject.submitTimeoutMs, 'submitTimeoutMs');
+    const environment = parseEnvironmentInfo(await getJson(`${baseUrl}environments/${environmentId}`));
+    assertEnvironmentId(environment.id);
+    const runtime: RequiredRuntimeConfig = {
+      binaryPath: '',
+      queueDir: undefined,
+      sdkCreatedQueueDir: false,
+      sdkCreatedStateDir: false,
+      baseUrl,
+      host: { kind: 'http', baseUrl },
+      worker: { kind: 'external' },
+      workspace: { kind: 'new' },
+      policy: materializePolicy(),
+      lifecycle: {
+        destroyOnClose: false,
+        cleanupQueueOnClose: false,
+        cleanupStateOnClose: false,
+      },
+      submitTimeoutMs,
+      transport: { kind: 'direct' },
+    };
+    return new ExecutionerEnvironment(runtime, environment, [], false);
   }
 
   get environment(): EnvironmentInfo {
@@ -472,15 +515,17 @@ export class ExecutionerEnvironment {
 
     let environment: EnvironmentInfo;
     try {
-      environment = this.config.lifecycle.destroyOnClose
-        ? parseEnvironmentInfo(await deleteJson(`${this.config.baseUrl}environments/${this.environmentInfo.id}`))
-        : parseEnvironmentInfo(await postJson(`${this.config.baseUrl}environments/${this.environmentInfo.id}/close`, null));
+      environment = this.ownsEnvironment
+        ? this.config.lifecycle.destroyOnClose
+          ? parseEnvironmentInfo(await deleteJson(`${this.config.baseUrl}environments/${this.environmentInfo.id}`))
+          : parseEnvironmentInfo(await postJson(`${this.config.baseUrl}environments/${this.environmentInfo.id}/close`, null))
+        : this.environmentInfo;
     } finally {
       for (const managed of [...hosts].reverse()) {
         await terminateProcess(managed);
       }
       if (this.config.lifecycle.cleanupQueueOnClose) {
-        await cleanupQueueDir(this.config.queueDir, this.config.sdkCreatedQueueDir);
+        await cleanupQueueDir(requiredQueueDir(this.config), this.config.sdkCreatedQueueDir);
       }
       if (this.config.lifecycle.cleanupStateOnClose && this.config.host.kind === 'managed') {
         await cleanupStateDir(this.config.host.stateDir, this.config.sdkCreatedStateDir);
@@ -540,15 +585,23 @@ export class ExecutionerSession {
     };
     assertSerializedJsonSize('tool invocation request', request, MAX_REQUEST_JSON_BYTES);
 
-    await ensureFileQueue(this.config.queueDir);
-    ensureInvocationIdUnused(this.config.queueDir, invocationId);
+    if (this.config.transport.kind === 'direct') {
+      return parseSubmitResult(await postJson(
+        `${this.config.baseUrl}sessions/${this.sessionInfo.id}/invocations`,
+        request,
+      ));
+    }
+
+    const queueDir = this.config.transport.queueDir;
+    await ensureFileQueue(queueDir);
+    ensureInvocationIdUnused(queueDir, invocationId);
     await writeJsonAtomic(
-      join(this.config.queueDir, 'pending', `${invocationId}.json`),
+      join(queueDir, 'pending', `${invocationId}.json`),
       request,
     );
 
     return waitForResult(
-      this.config.queueDir,
+      queueDir,
       invocationId,
       this.sessionInfo.id,
       call.toolName,
@@ -679,7 +732,7 @@ async function cleanupPartialCreate(
     }
   }
   if (runtime.lifecycle.cleanupQueueOnClose) {
-    await cleanupQueueDir(runtime.queueDir, runtime.sdkCreatedQueueDir);
+    await cleanupQueueDir(requiredQueueDir(runtime), runtime.sdkCreatedQueueDir);
   }
   if (runtime.lifecycle.cleanupStateOnClose && runtime.host.kind === 'managed') {
     await cleanupStateDir(runtime.host.stateDir, runtime.sdkCreatedStateDir);
@@ -688,7 +741,7 @@ async function cleanupPartialCreate(
 
 type RequiredRuntimeConfig = {
   binaryPath: string;
-  queueDir: string;
+  queueDir?: string;
   sdkCreatedQueueDir: boolean;
   sdkCreatedStateDir: boolean;
   baseUrl: string;
@@ -698,6 +751,7 @@ type RequiredRuntimeConfig = {
   policy: RequiredPolicyConfig;
   lifecycle: Required<LifecycleConfig>;
   submitTimeoutMs: number;
+  transport: { kind: 'file'; queueDir: string } | { kind: 'direct' };
 };
 
 type RequiredPolicyConfig = {
@@ -838,7 +892,18 @@ async function materializeConfig(config: EnvironmentConfig): Promise<RequiredRun
     policy,
     lifecycle,
     submitTimeoutMs,
+    transport: { kind: 'file', queueDir },
   };
+}
+
+function requiredQueueDir(config: RequiredRuntimeConfig): string {
+  if (config.transport.kind === 'file') {
+    return config.transport.queueDir;
+  }
+  if (config.queueDir !== undefined) {
+    return config.queueDir;
+  }
+  throw new Error('Executioner environment has no file queue');
 }
 
 function materializePolicy(policy?: PolicyConfig): RequiredPolicyConfig {
@@ -1486,6 +1551,14 @@ async function postJson(url: string, body: unknown): Promise<unknown> {
 
 async function deleteJson(url: string): Promise<unknown> {
   const response = await fetch(url, { method: 'DELETE', redirect: 'error' });
+  if (!response.ok) {
+    throw new Error(`Executioner host returned ${response.status}: ${await cappedResponseText(response, MAX_HTTP_ERROR_BODY_BYTES)}`);
+  }
+  return cappedResponseJson(response, MAX_HTTP_JSON_BODY_BYTES);
+}
+
+async function getJson(url: string): Promise<unknown> {
+  const response = await fetch(url, { method: 'GET', redirect: 'error' });
   if (!response.ok) {
     throw new Error(`Executioner host returned ${response.status}: ${await cappedResponseText(response, MAX_HTTP_ERROR_BODY_BYTES)}`);
   }

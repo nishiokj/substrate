@@ -166,6 +166,86 @@ describe('ExecutionerEnvironment file queue validation', () => {
     }
   });
 
+  test('attach connects to an existing environment without owning its lifecycle', async () => {
+    const calls: string[] = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        const url = new URL(request.url);
+        calls.push(`${request.method} ${url.pathname}`);
+        if (request.method === 'GET' && url.pathname === '/environments/env_shared') {
+          return Response.json({
+            id: 'env_shared',
+            state: 'ready',
+            workspace: {
+              root: '/tmp/workspace',
+              logicalRoot: '/workspace',
+              mode: 'new',
+              fresh: true,
+              managed: true,
+            },
+            createdAt: 'now',
+            revision: 7,
+            metadata: {},
+          });
+        }
+        if (request.method === 'POST' && url.pathname === '/environments/env_shared/sessions') {
+          return Response.json({
+            session: {
+              id: 'sess_shared',
+              state: 'ready',
+              workspace: {
+                root: '/tmp/workspace',
+                logicalRoot: '/workspace',
+                mode: 'new',
+                fresh: true,
+                managed: true,
+              },
+              createdAt: 'now',
+              metadata: {},
+            },
+          });
+        }
+        if (request.method === 'POST' && url.pathname === '/sessions/sess_shared/invocations') {
+          const body = await request.json();
+          return Response.json({
+            invocationId: body.invocationId,
+            sessionId: 'sess_shared',
+            toolName: body.toolName,
+            status: 'success',
+            output: 'attached',
+            error: null,
+            summary: null,
+            effects: [],
+            durationMs: 1,
+            metadata: {},
+          });
+        }
+        return new Response('not found', { status: 404 });
+      },
+    });
+
+    try {
+      const env = await ExecutionerEnvironment.attach({
+        host: { kind: 'http', baseUrl: `http://127.0.0.1:${server.port}/` },
+        environmentId: 'env_shared',
+      });
+      const session = await env.createSession();
+      const result = await session.submit(tool('Read', { path: 'notes.txt' }));
+      const closed = await env.close();
+
+      expect(result.output).toBe('attached');
+      expect(closed.id).toBe('env_shared');
+      expect(calls).toEqual([
+        'GET /environments/env_shared',
+        'POST /environments/env_shared/sessions',
+        'POST /sessions/sess_shared/invocations',
+      ]);
+    } finally {
+      server.stop(true);
+    }
+  });
+
   test('create rejects malformed config values before spawning processes', async () => {
     await expect(ExecutionerEnvironment.create({
       host: { kind: 'http', baseUrl: 'http://127.0.0.1:1/' },

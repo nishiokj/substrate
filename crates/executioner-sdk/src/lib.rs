@@ -85,6 +85,28 @@ pub struct EnvironmentConfig {
     pub submit_timeout: Duration,
 }
 
+#[derive(Debug, Clone)]
+pub struct AttachedEnvironmentConfig {
+    pub base_url: String,
+    pub environment_id: String,
+    pub submit_timeout: Duration,
+}
+
+impl AttachedEnvironmentConfig {
+    pub fn http_direct(base_url: impl Into<String>, environment_id: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into(),
+            environment_id: environment_id.into(),
+            submit_timeout: Duration::from_secs(30),
+        }
+    }
+
+    pub fn submit_timeout(mut self, timeout: Duration) -> Self {
+        self.submit_timeout = timeout;
+        self
+    }
+}
+
 impl EnvironmentConfig {
     pub fn builder() -> EnvironmentConfigBuilder {
         EnvironmentConfigBuilder::default()
@@ -625,21 +647,28 @@ pub enum EffectKind {
 #[derive(Debug)]
 pub struct ExecutionerEnvironment {
     environment: EnvironmentInfo,
-    backend: Arc<BackendClient>,
+    session_transport: SessionTransport,
     queue_dir: Option<QueueDir>,
     host: Arc<HostBackend>,
     worker: WorkerDriver,
     lifecycle: LifecycleConfig,
     submit_timeout: Duration,
+    owns_environment: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct ExecutionerSession {
     session: SessionInfo,
-    backend: Arc<BackendClient>,
+    transport: SessionTransport,
     host: Arc<HostBackend>,
     inline_worker: Option<Worker>,
     submit_timeout: Duration,
+}
+
+#[derive(Debug, Clone)]
+enum SessionTransport {
+    Broker(Arc<BackendClient>),
+    Direct,
 }
 
 #[derive(Debug, Clone)]
@@ -706,12 +735,32 @@ impl ExecutionerEnvironment {
 
         Ok(Self {
             environment: environment.into(),
-            backend,
+            session_transport: SessionTransport::Broker(Arc::clone(&backend)),
             queue_dir,
             host,
             worker,
             lifecycle: config.lifecycle,
             submit_timeout: validate_submit_timeout(config.submit_timeout)?,
+            owns_environment: true,
+        })
+    }
+
+    pub async fn attach(config: AttachedEnvironmentConfig) -> Result<Self> {
+        validate_environment_id(&config.environment_id)?;
+        let host = Arc::new(HostBackend::from_config(HostConfig::ConnectHttp {
+            base_url: config.base_url,
+        })?);
+        let environment = host.get_environment(&config.environment_id).await?;
+        validate_environment_id(&environment.id)?;
+        Ok(Self {
+            environment: environment.into(),
+            session_transport: SessionTransport::Direct,
+            queue_dir: None,
+            host,
+            worker: WorkerDriver::External,
+            lifecycle: LifecycleConfig::close_environment(),
+            submit_timeout: validate_submit_timeout(config.submit_timeout)?,
+            owns_environment: false,
         })
     }
 
@@ -742,7 +791,7 @@ impl ExecutionerEnvironment {
         validate_session_id(&session.id)?;
         Ok(ExecutionerSession {
             session: session.into(),
-            backend: Arc::clone(&self.backend),
+            transport: self.session_transport.clone(),
             host: Arc::clone(&self.host),
             inline_worker: match &self.worker {
                 WorkerDriver::InProcess(worker) => Some(worker.clone()),
@@ -755,13 +804,18 @@ impl ExecutionerEnvironment {
     pub async fn close(&self) -> Result<EnvironmentInfo> {
         let worker_result = self.worker.shutdown().await;
 
-        let environment_result = match self.lifecycle.close_behavior {
-            CloseBehavior::DestroyEnvironment => {
-                self.host.destroy_environment(&self.environment.id).await
+        let environment_result: Result<EnvironmentInfo> = if self.owns_environment {
+            match self.lifecycle.close_behavior {
+                CloseBehavior::DestroyEnvironment => {
+                    self.host.destroy_environment(&self.environment.id).await
+                }
+                CloseBehavior::CloseEnvironment => {
+                    self.host.close_environment(&self.environment.id).await
+                }
             }
-            CloseBehavior::CloseEnvironment => {
-                self.host.close_environment(&self.environment.id).await
-            }
+            .map(Into::into)
+        } else {
+            Ok(self.environment.clone())
         };
 
         let cleanup_result: Result<()> =
@@ -777,7 +831,7 @@ impl ExecutionerEnvironment {
 
         worker_result?;
         match (environment_result, cleanup_result) {
-            (Ok(environment), Ok(())) => Ok(environment.into()),
+            (Ok(environment), Ok(())) => Ok(environment),
             (Err(err), _) => Err(err),
             (Ok(_), Err(err)) => Err(err),
         }
@@ -824,10 +878,21 @@ impl ExecutionerSession {
         };
         validate_serialized_request_size("tool invocation request", &request)?;
 
-        self.backend
-            .enqueue(&request)
-            .map_err(|err| SdkError::Broker(err.to_string()))?;
-        self.wait_for_result(&invocation_id, &tool_name).await
+        match &self.transport {
+            SessionTransport::Broker(backend) => {
+                backend
+                    .enqueue(&request)
+                    .map_err(|err| SdkError::Broker(err.to_string()))?;
+                self.wait_for_result(backend, &invocation_id, &tool_name)
+                    .await
+            }
+            SessionTransport::Direct => self
+                .host
+                .execute(request)
+                .await
+                .map(Into::into)
+                .map_err(|err| SdkError::Host(err.to_string())),
+        }
     }
 
     pub async fn list_files(&self, cwd: impl Into<String>) -> Result<Vec<String>> {
@@ -848,11 +913,15 @@ impl ExecutionerSession {
             .map(Into::into)
     }
 
-    async fn wait_for_result(&self, invocation_id: &str, tool_name: &str) -> Result<SubmitResult> {
+    async fn wait_for_result(
+        &self,
+        backend: &BackendClient,
+        invocation_id: &str,
+        tool_name: &str,
+    ) -> Result<SubmitResult> {
         let started_at = Instant::now();
         loop {
-            if let Some(completed) = self
-                .backend
+            if let Some(completed) = backend
                 .read_completed(invocation_id)
                 .map_err(|err| SdkError::Broker(err.to_string()))?
             {
@@ -871,8 +940,7 @@ impl ExecutionerSession {
                 return Ok(completed.result.into());
             }
 
-            if let Some(failed) = self
-                .backend
+            if let Some(failed) = backend
                 .read_failed(invocation_id)
                 .map_err(|err| SdkError::Broker(err.to_string()))?
             {
@@ -896,7 +964,7 @@ impl ExecutionerSession {
 
             if let Some(worker) = &self.inline_worker {
                 worker
-                    .run_once(&*self.backend, &*self.host)
+                    .run_once(backend, &*self.host)
                     .await
                     .map_err(|err| SdkError::Broker(err.to_string()))?;
             }
@@ -1140,6 +1208,15 @@ impl HostBackend {
         }
     }
 
+    async fn get_environment(&self, environment_id: &str) -> Result<Environment> {
+        match self {
+            Self::InProcess(state) => state
+                .get_environment(environment_id)
+                .map_err(|err| SdkError::Host(err.to_string())),
+            Self::Http(host) => host.get_environment(environment_id).await,
+        }
+    }
+
     async fn close_environment(&self, environment_id: &str) -> Result<Environment> {
         match self {
             Self::InProcess(state) => state
@@ -1222,6 +1299,12 @@ impl HttpHostBackend {
     ) -> Result<CreateSessionResponse> {
         validate_environment_id(environment_id)?;
         self.post_json(&format!("environments/{environment_id}/sessions"), &request)
+            .await
+    }
+
+    async fn get_environment(&self, environment_id: &str) -> Result<Environment> {
+        validate_environment_id(environment_id)?;
+        self.get_json(&format!("environments/{environment_id}"))
             .await
     }
 
@@ -1312,6 +1395,30 @@ impl HttpHostBackend {
         B: serde::Serialize + ?Sized,
     {
         self.post_json_anyhow(path, body)
+            .await
+            .map_err(|err| SdkError::Transport(err.to_string()))
+    }
+
+    async fn get_json<T>(&self, path: &str) -> Result<T>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let url = self
+            .base_url
+            .join(path)
+            .map_err(|err| SdkError::Config(format!("invalid host url: {err}")))?;
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|err| SdkError::Transport(err.to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = capped_response_text(response, MAX_HTTP_ERROR_BODY_BYTES).await;
+            return Err(SdkError::Host(format!("host returned {status}: {text}")));
+        }
+        read_capped_json_response::<T>(response, MAX_HTTP_JSON_BODY_BYTES)
             .await
             .map_err(|err| SdkError::Transport(err.to_string()))
     }
@@ -2975,6 +3082,59 @@ mod tests {
 
         env.close().await.unwrap();
         worker.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn attached_environment_submits_directly_without_owning_lifecycle() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = HostState::new(temp.path().join("host-state")).unwrap();
+        let environment = state
+            .create_environment(CreateEnvironmentRequest {
+                environment_id: Some("env_attached".to_string()),
+                workspace: WorkspaceSpec {
+                    mode: WorkspaceMode::New,
+                    root: None,
+                    snapshot_ref: None,
+                    template_ref: None,
+                    mount_as_workspace: true,
+                },
+                policy: PolicyConfig::default().into_execution_policy(),
+                ttl_ms: None,
+                metadata: Map::new(),
+            })
+            .unwrap()
+            .environment;
+        let app = executioner_host::HostServer::new(state.clone()).router();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let host_url = format!("http://{addr}/");
+
+        let env = ExecutionerEnvironment::attach(AttachedEnvironmentConfig::http_direct(
+            host_url,
+            environment.id.clone(),
+        ))
+        .await
+        .unwrap();
+        let session = env.create_session().await.unwrap();
+        let write = session
+            .submit(
+                ToolCall::json(
+                    "Write",
+                    json!({ "path": "attached.txt", "content": "direct" }),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(write.status, ToolStatus::Success);
+        assert_eq!(env.close().await.unwrap().id, environment.id);
+        assert_eq!(
+            state.get_environment(&environment.id).unwrap().state,
+            EnvironmentState::Ready
+        );
         server.abort();
     }
 

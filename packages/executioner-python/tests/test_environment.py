@@ -132,6 +132,103 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
             "metadata": {"toolCallId": "call_1"},
         }])
 
+    def test_attach_connects_to_existing_environment_without_owning_lifecycle(self) -> None:
+        calls: list[str] = []
+
+        class AttachHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                calls.append(f"GET {self.path}")
+                if self.path == "/environments/env_shared":
+                    self._json({
+                        "id": "env_shared",
+                        "state": "ready",
+                        "workspace": {
+                            "root": "/tmp/workspace",
+                            "logicalRoot": "/workspace",
+                            "mode": "new",
+                            "fresh": True,
+                            "managed": True,
+                        },
+                        "createdAt": "now",
+                        "revision": 7,
+                        "metadata": {},
+                    })
+                    return
+                self.send_error(404)
+
+            def do_POST(self) -> None:
+                calls.append(f"POST {self.path}")
+                if self.path == "/environments/env_shared/sessions":
+                    self._json({
+                        "session": {
+                            "id": "sess_shared",
+                            "state": "ready",
+                            "workspace": {
+                                "root": "/tmp/workspace",
+                                "logicalRoot": "/workspace",
+                                "mode": "new",
+                                "fresh": True,
+                                "managed": True,
+                            },
+                            "createdAt": "now",
+                            "metadata": {},
+                        }
+                    })
+                    return
+                if self.path == "/sessions/sess_shared/invocations":
+                    body = json.loads(self.rfile.read(int(self.headers.get("content-length", "0"))))
+                    self._json({
+                        "invocationId": body["invocationId"],
+                        "sessionId": "sess_shared",
+                        "toolName": body["toolName"],
+                        "status": "success",
+                        "output": "attached",
+                        "error": None,
+                        "summary": None,
+                        "effects": [],
+                        "durationMs": 1,
+                        "metadata": {},
+                    })
+                    return
+                self.send_error(404)
+
+            def do_DELETE(self) -> None:
+                calls.append(f"DELETE {self.path}")
+                self.send_error(500)
+
+            def _json(self, body: dict[str, object]) -> None:
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(body).encode("utf-8"))
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), AttachHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            env = ExecutionerEnvironment.attach(
+                host={"kind": "http", "baseUrl": f"http://127.0.0.1:{server.server_address[1]}/"},
+                environmentId="env_shared",
+            )
+            session = env.create_session()
+            result = session.submit(tool("Read", path="notes.txt"))
+            closed = env.close()
+
+            self.assertEqual(result.output, "attached")
+            self.assertEqual(closed.id, "env_shared")
+            self.assertEqual(calls, [
+                "GET /environments/env_shared",
+                "POST /environments/env_shared/sessions",
+                "POST /sessions/sess_shared/invocations",
+            ])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=1)
+
     def test_rejects_invalid_session_id_before_url_construction(self) -> None:
         with self.assertRaisesRegex(ValueError, "invalid session id"):
             _assert_session_id("../escaped")

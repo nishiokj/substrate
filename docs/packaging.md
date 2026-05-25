@@ -26,6 +26,17 @@ await ExecutionerEnvironment.create({
 });
 ```
 
+Clients that are joining an environment created elsewhere should use attach
+instead. Attach is also remote-only and does not require a runtime binary,
+worker process, or file broker queue:
+
+```ts
+await ExecutionerEnvironment.attach({
+  host: { kind: 'http', baseUrl: 'http://127.0.0.1:8765' },
+  environmentId: 'env_shared',
+});
+```
+
 Local managed usage starts the runtime binary automatically:
 
 ```ts

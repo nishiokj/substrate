@@ -20,6 +20,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone)]
 pub struct HostState {
     inner: Arc<Mutex<HostInner>>,
+    environment_execution_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 #[derive(Debug)]
@@ -28,6 +29,8 @@ struct HostInner {
     environments: HashMap<String, EnvironmentRecord>,
     sessions: HashMap<String, SessionRecord>,
     effects: HashMap<String, Vec<Effect>>,
+    active_environment_invocations: HashMap<String, usize>,
+    active_session_invocations: HashMap<String, usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,7 +63,10 @@ impl HostState {
                 environments: HashMap::new(),
                 sessions: HashMap::new(),
                 effects: HashMap::new(),
+                active_environment_invocations: HashMap::new(),
+                active_session_invocations: HashMap::new(),
             })),
+            environment_execution_locks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -91,6 +97,11 @@ impl HostState {
         validate_environment_id(environment_id)?;
         let mut inner = self.lock()?;
         inner.purge_expired_environments()?;
+        if inner.environment_active(environment_id) {
+            return Err(ExecutionerError::InvalidRequest(format!(
+                "environment has active invocations: {environment_id}"
+            )));
+        }
         let environment = {
             let record = inner
                 .environments
@@ -111,7 +122,10 @@ impl HostState {
         validate_environment_id(environment_id)?;
         let mut inner = self.lock()?;
         inner.purge_expired_environments()?;
-        inner.destroy_environment(environment_id)
+        let environment = inner.destroy_environment(environment_id)?;
+        drop(inner);
+        self.remove_environment_execution_lock(environment_id);
+        Ok(environment)
     }
 
     pub fn create_session(
@@ -154,6 +168,11 @@ impl HostState {
         validate_session_id(session_id)?;
         let mut inner = self.lock()?;
         inner.purge_expired_environments()?;
+        if inner.session_active(session_id) {
+            return Err(ExecutionerError::InvalidRequest(format!(
+                "session has active invocations: {session_id}"
+            )));
+        }
         let record = inner
             .sessions
             .get_mut(session_id)
@@ -166,6 +185,11 @@ impl HostState {
         validate_session_id(session_id)?;
         let mut inner = self.lock()?;
         inner.purge_expired_environments()?;
+        if inner.session_active(session_id) {
+            return Err(ExecutionerError::InvalidRequest(format!(
+                "session has active invocations: {session_id}"
+            )));
+        }
         let mut record = inner
             .sessions
             .remove(session_id)
@@ -193,6 +217,11 @@ impl HostState {
         if session.state != SessionState::Ready {
             return Err(ExecutionerError::SessionNotReady(request.session_id));
         }
+        let _active_invocation = self.begin_active_invocation(&environment_id, &session.id)?;
+        let execution_lock = self.environment_execution_lock(&environment_id)?;
+        let _execution_guard = execution_lock.lock().map_err(|_| {
+            ExecutionerError::InvalidRequest("environment execution lock poisoned".to_string())
+        })?;
         if !request.required_capabilities.is_empty() {
             return Ok(required_capabilities_denied_result(&session, &request));
         }
@@ -279,6 +308,23 @@ impl HostState {
             .map_err(|_| ExecutionerError::InvalidRequest("host state lock poisoned".to_string()))
     }
 
+    fn environment_execution_lock(&self, environment_id: &str) -> Result<Arc<Mutex<()>>> {
+        let mut locks = self.environment_execution_locks.lock().map_err(|_| {
+            ExecutionerError::InvalidRequest("environment execution lock poisoned".to_string())
+        })?;
+        Ok(Arc::clone(
+            locks
+                .entry(environment_id.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        ))
+    }
+
+    fn remove_environment_execution_lock(&self, environment_id: &str) {
+        if let Ok(mut locks) = self.environment_execution_locks.lock() {
+            locks.remove(environment_id);
+        }
+    }
+
     fn execution_session(&self, session_id: &str) -> Result<(Session, String)> {
         validate_session_id(session_id)?;
         let mut inner = self.lock()?;
@@ -303,6 +349,58 @@ impl HostState {
             session_with_environment(session_record.session, &environment),
             environment.id,
         ))
+    }
+
+    fn begin_active_invocation(
+        &self,
+        environment_id: &str,
+        session_id: &str,
+    ) -> Result<ActiveInvocationGuard> {
+        let mut inner = self.lock()?;
+        inner.purge_expired_environments()?;
+        let session_record = inner
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| ExecutionerError::SessionNotFound(session_id.to_string()))?;
+        if session_record.environment_id != environment_id {
+            return Err(ExecutionerError::InvalidRequest(format!(
+                "session {session_id} is not attached to environment {environment_id}"
+            )));
+        }
+        let environment = inner
+            .environments
+            .get(environment_id)
+            .ok_or_else(|| ExecutionerError::SessionNotFound(environment_id.to_string()))?;
+        if environment.environment.state != EnvironmentState::Ready
+            || session_record.session.state != SessionState::Ready
+        {
+            return Err(ExecutionerError::SessionNotReady(session_id.to_string()));
+        }
+        inner.begin_active_invocation(environment_id, session_id);
+        Ok(ActiveInvocationGuard {
+            state: self.clone(),
+            environment_id: environment_id.to_string(),
+            session_id: session_id.to_string(),
+        })
+    }
+
+    fn finish_active_invocation(&self, environment_id: &str, session_id: &str) {
+        if let Ok(mut inner) = self.lock() {
+            inner.finish_active_invocation(environment_id, session_id);
+        }
+    }
+}
+
+struct ActiveInvocationGuard {
+    state: HostState,
+    environment_id: String,
+    session_id: String,
+}
+
+impl Drop for ActiveInvocationGuard {
+    fn drop(&mut self) {
+        self.state
+            .finish_active_invocation(&self.environment_id, &self.session_id);
     }
 }
 
@@ -626,6 +724,11 @@ impl HostInner {
     }
 
     fn destroy_environment(&mut self, environment_id: &str) -> Result<Environment> {
+        if self.environment_active(environment_id) {
+            return Err(ExecutionerError::InvalidRequest(format!(
+                "environment has active invocations: {environment_id}"
+            )));
+        }
         let mut record = self
             .environments
             .remove(environment_id)
@@ -633,6 +736,7 @@ impl HostInner {
         record.environment.state = EnvironmentState::Destroyed;
         cleanup_managed_workspace_binding(&self.base_dir, &record.environment.workspace);
         self.effects.remove(environment_id);
+        self.active_environment_invocations.remove(environment_id);
         let session_ids = self
             .sessions
             .iter()
@@ -646,6 +750,7 @@ impl HostInner {
             .collect::<Vec<_>>();
         for session_id in session_ids {
             self.sessions.remove(&session_id);
+            self.active_session_invocations.remove(&session_id);
         }
         Ok(record.environment)
     }
@@ -670,6 +775,47 @@ impl HostInner {
         }
 
         Ok(())
+    }
+
+    fn begin_active_invocation(&mut self, environment_id: &str, session_id: &str) {
+        *self
+            .active_environment_invocations
+            .entry(environment_id.to_string())
+            .or_default() += 1;
+        *self
+            .active_session_invocations
+            .entry(session_id.to_string())
+            .or_default() += 1;
+    }
+
+    fn finish_active_invocation(&mut self, environment_id: &str, session_id: &str) {
+        decrement_active_count(&mut self.active_environment_invocations, environment_id);
+        decrement_active_count(&mut self.active_session_invocations, session_id);
+    }
+
+    fn environment_active(&self, environment_id: &str) -> bool {
+        self.active_environment_invocations
+            .get(environment_id)
+            .copied()
+            .unwrap_or_default()
+            > 0
+    }
+
+    fn session_active(&self, session_id: &str) -> bool {
+        self.active_session_invocations
+            .get(session_id)
+            .copied()
+            .unwrap_or_default()
+            > 0
+    }
+}
+
+fn decrement_active_count(counts: &mut HashMap<String, usize>, id: &str) {
+    if let Some(count) = counts.get_mut(id) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            counts.remove(id);
+        }
     }
 }
 

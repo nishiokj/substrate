@@ -79,6 +79,8 @@ Responsibilities:
 - Bind the workspace to a stable logical root: `/workspace`.
 - Validate and normalize paths.
 - Execute primitive tools.
+- Serialize tool execution per environment so multiple sessions share one
+  mutable workspace through an ordered stream.
 - Enforce session policy.
 - Record durable effects.
 - Return a semantic result for agent consumption.

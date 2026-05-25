@@ -36,6 +36,22 @@ with ExecutionerEnvironment.create(workspace={"kind": "new"}, policy={"process":
     env.materialize_workspace_artifact(artifact, "/tmp/restored-workspace")
 ```
 
+To join an environment created by another process or client, attach to it. An
+attached handle can create sessions and submit tool calls, but it does not close
+or destroy the environment when the handle is closed:
+
+```py
+env = ExecutionerEnvironment.attach(
+    host={"kind": "http", "baseUrl": "http://127.0.0.1:8765/"},
+    environmentId="env_shared",
+)
+try:
+    session = env.create_session()
+    session.write("client-a.txt", "hello")
+finally:
+    env.close()
+```
+
 For an agent loop, pass Substrate's schemas into the model request, then execute
 matching tool-use blocks directly:
 
@@ -77,4 +93,5 @@ with ExecutionerEnvironment.create(
 
 The package hides the file-backed queue and worker transport, but keeps
 environment and session lifecycles explicit. Multiple sessions can attach to the
-same environment.
+same environment. The host serializes tool execution per environment so those
+sessions share one mutable workspace through an ordered stream.

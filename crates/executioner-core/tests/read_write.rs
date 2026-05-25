@@ -210,6 +210,164 @@ fn multiple_sessions_can_share_one_environment_workspace() {
 }
 
 #[test]
+fn many_sessions_can_share_one_environment_workspace() {
+    let temp = TempDir::new().unwrap();
+    let host = HostState::new(temp.path()).unwrap();
+    let environment = host
+        .create_environment(CreateEnvironmentRequest {
+            environment_id: Some("env_many".to_string()),
+            workspace: WorkspaceSpec {
+                mode: WorkspaceMode::New,
+                root: None,
+                snapshot_ref: None,
+                template_ref: None,
+                mount_as_workspace: true,
+            },
+            policy: policy(),
+            ttl_ms: None,
+            metadata: Map::new(),
+        })
+        .unwrap()
+        .environment;
+
+    let sessions = (0..30)
+        .map(|index| {
+            host.create_session(
+                &environment.id,
+                CreateSessionRequest {
+                    session_id: Some(format!("sess_many_{index}")),
+                    policy: None,
+                    metadata: Map::new(),
+                },
+            )
+            .unwrap()
+            .session
+        })
+        .collect::<Vec<_>>();
+
+    for (index, session) in sessions.iter().enumerate() {
+        host.execute_invocation(invoke(
+            &session.id,
+            "Write",
+            json!({ "path": format!("client-{index}.txt"), "content": format!("hello {index}") }),
+        ))
+        .unwrap();
+    }
+
+    let listing = host
+        .execute_invocation(invoke(&sessions[29].id, "List", json!({})))
+        .unwrap();
+    assert_eq!(listing.status, ToolResultStatus::Success);
+    assert!(listing.output.contains("client-0.txt"));
+    assert!(listing.output.contains("client-29.txt"));
+    assert_eq!(host.get_environment(&environment.id).unwrap().revision, 30);
+}
+
+#[test]
+fn active_invocations_block_session_and_environment_teardown() {
+    let temp = TempDir::new().unwrap();
+    let host = HostState::new(temp.path()).unwrap();
+    let mut exec_policy = policy();
+    exec_policy.process.allow_exec = true;
+    exec_policy.process.allowed_commands = vec!["sleep".to_string()];
+    let session =
+        create_session_with_policy_and_id(&host, exec_policy, "env_active", "sess_active");
+    let worker_host = host.clone();
+    let session_id = session.id.clone();
+    let worker = std::thread::spawn(move || {
+        worker_host
+            .execute_invocation(invoke(&session_id, "Bash", json!({ "command": "sleep 1" })))
+            .unwrap()
+    });
+    std::thread::sleep(Duration::from_millis(100));
+
+    let mut blocked_session = None;
+    let mut blocked_environment = None;
+    for _ in 0..50 {
+        blocked_session = host.close_session(&session.id).err();
+        blocked_environment = host.destroy_environment("env_active").err();
+        if blocked_session.is_some() && blocked_environment.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    assert!(blocked_session
+        .unwrap()
+        .to_string()
+        .contains("session has active invocations"));
+    assert!(blocked_environment
+        .unwrap()
+        .to_string()
+        .contains("environment has active invocations"));
+
+    let result = worker.join().unwrap();
+    assert_eq!(result.status, ToolResultStatus::Success);
+    host.destroy_environment("env_active").unwrap();
+}
+
+#[test]
+fn environment_invocations_are_serialized_across_sessions() {
+    let temp = TempDir::new().unwrap();
+    let host = HostState::new(temp.path()).unwrap();
+    let mut exec_policy = policy();
+    exec_policy.process.allow_exec = true;
+    exec_policy.process.allowed_commands = vec!["sleep".to_string()];
+    let environment = host
+        .create_environment(CreateEnvironmentRequest {
+            environment_id: Some("env_serial".to_string()),
+            workspace: WorkspaceSpec {
+                mode: WorkspaceMode::New,
+                root: None,
+                snapshot_ref: None,
+                template_ref: None,
+                mount_as_workspace: true,
+            },
+            policy: exec_policy,
+            ttl_ms: None,
+            metadata: Map::new(),
+        })
+        .unwrap()
+        .environment;
+    let sessions = ["sess_serial_a", "sess_serial_b"]
+        .into_iter()
+        .map(|session_id| {
+            host.create_session(
+                &environment.id,
+                CreateSessionRequest {
+                    session_id: Some(session_id.to_string()),
+                    policy: None,
+                    metadata: Map::new(),
+                },
+            )
+            .unwrap()
+            .session
+        })
+        .collect::<Vec<_>>();
+
+    let started = std::time::Instant::now();
+    let handles = sessions
+        .into_iter()
+        .map(|session| {
+            let host = host.clone();
+            std::thread::spawn(move || {
+                host.execute_invocation(invoke(
+                    &session.id,
+                    "Bash",
+                    json!({ "command": "sleep 0.3" }),
+                ))
+                .unwrap()
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for handle in handles {
+        assert_eq!(handle.join().unwrap().status, ToolResultStatus::Success);
+    }
+    assert!(started.elapsed() >= Duration::from_millis(500));
+}
+
+#[test]
 fn closing_one_session_preserves_shared_environment_for_other_sessions() {
     let temp = TempDir::new().unwrap();
     let host = HostState::new(temp.path()).unwrap();

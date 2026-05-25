@@ -90,6 +90,21 @@ with ExecutionerEnvironment.create(
     print(session.bash("ls /workspace"))
 ```
 
+To connect another client to an existing live environment, use attach rather
+than creating another environment:
+
+```py
+env = ExecutionerEnvironment.attach(
+    host={"kind": "http", "baseUrl": "http://127.0.0.1:8765/"},
+    environmentId="env_shared",
+)
+session = env.create_session()
+```
+
+Attached handles do not own environment shutdown. Multiple sessions may share
+one environment; the host serializes tool execution per environment so they
+share one mutable workspace through an ordered stream.
+
 Minimal agent-loop shape:
 
 ```py

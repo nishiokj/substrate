@@ -1,4 +1,6 @@
 from .environment import (
+    AttachedEnvironmentConfig,
+    AttachedHostConfig,
     BackendConfig,
     EditToolArguments,
     EnvironmentInfo,
@@ -27,6 +29,8 @@ from .environment import (
 
 __all__ = [
     "BackendConfig",
+    "AttachedEnvironmentConfig",
+    "AttachedHostConfig",
     "EditToolArguments",
     "EnvironmentInfo",
     "ExecutionerEnvironment",
