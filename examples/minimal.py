@@ -1,6 +1,10 @@
-from substrate import Environment
+from substrate import ExecutionerEnvironment
 
-with Environment.create(workspace="new", allow_commands=["ls"]) as env:
-    env.write("notes.txt", "hello")
-    print(env.read("notes.txt"))
-    print(env.bash("ls /workspace"))
+with ExecutionerEnvironment.create(
+    workspace={"kind": "new"},
+    policy={"process": {"allowExec": True, "allowedCommands": ["ls"]}},
+) as env:
+    session = env.create_session()
+    session.write("notes.txt", "hello")
+    print(session.read("notes.txt"))
+    print(session.bash("ls /workspace"))

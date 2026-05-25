@@ -1,11 +1,12 @@
 use anyhow::{bail, Context};
 use async_trait::async_trait;
 use executioner_core::{
-    CreateSessionRequest, CreateSessionResponse, EffectOperation, ExecutionPolicy, HostState,
-    NetworkPolicy, ProcessPolicy, Session, SessionState, ToolInvocationCompleted,
+    CreateEnvironmentRequest, CreateEnvironmentResponse, CreateSessionRequest,
+    CreateSessionResponse, EffectOperation, Environment, EnvironmentState, ExecutionPolicy,
+    HostState, NetworkPolicy, ProcessPolicy, Session, SessionState, ToolInvocationCompleted,
     ToolInvocationFailed, ToolInvocationRequest, ToolInvocationResult, ToolResultStatus,
-    WorkspaceArtifact, WorkspaceMode, WorkspaceSpec, MAX_OUTPUT_BYTES, MAX_REQUEST_JSON_BYTES,
-    MAX_SESSION_TTL_MS, MAX_TOOL_TIMEOUT_MS,
+    WorkspaceArtifact, WorkspaceMode, WorkspaceSpec, MAX_ENVIRONMENT_TTL_MS, MAX_OUTPUT_BYTES,
+    MAX_REQUEST_JSON_BYTES, MAX_TOOL_TIMEOUT_MS,
 };
 use executioner_worker::{ClaimedInvocation, FileBroker, InvocationBroker, ToolHostClient, Worker};
 use reqwest::Url;
@@ -408,7 +409,7 @@ pub struct LifecycleConfig {
 impl Default for LifecycleConfig {
     fn default() -> Self {
         Self {
-            close_behavior: CloseBehavior::DestroySession,
+            close_behavior: CloseBehavior::DestroyEnvironment,
             queue_cleanup: QueueCleanup::Preserve,
             ttl_ms: None,
         }
@@ -416,14 +417,14 @@ impl Default for LifecycleConfig {
 }
 
 impl LifecycleConfig {
-    pub fn close_session() -> Self {
+    pub fn close_environment() -> Self {
         Self {
-            close_behavior: CloseBehavior::CloseSession,
+            close_behavior: CloseBehavior::CloseEnvironment,
             ..Self::default()
         }
     }
 
-    pub fn destroy_session() -> Self {
+    pub fn destroy_environment() -> Self {
         Self::default()
     }
 
@@ -440,8 +441,8 @@ impl LifecycleConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseBehavior {
-    CloseSession,
-    DestroySession,
+    CloseEnvironment,
+    DestroyEnvironment,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -520,9 +521,32 @@ pub struct SessionInfo {
     pub metadata: Map<String, Value>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvironmentInfo {
+    pub id: String,
+    pub state: EnvironmentStatus,
+    pub workspace: WorkspaceInfo,
+    pub created_at: String,
+    pub expires_at: Option<String>,
+    pub metadata: Map<String, Value>,
+    pub revision: u64,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
+    Starting,
+    Ready,
+    Closing,
+    Closed,
+    Destroyed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvironmentStatus {
     Starting,
     Ready,
     Closing,
@@ -600,12 +624,21 @@ pub enum EffectKind {
 
 #[derive(Debug)]
 pub struct ExecutionerEnvironment {
-    session: SessionInfo,
+    environment: EnvironmentInfo,
     backend: Arc<BackendClient>,
     queue_dir: Option<QueueDir>,
     host: Arc<HostBackend>,
     worker: WorkerDriver,
     lifecycle: LifecycleConfig,
+    submit_timeout: Duration,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutionerSession {
+    session: SessionInfo,
+    backend: Arc<BackendClient>,
+    host: Arc<HostBackend>,
+    inline_worker: Option<Worker>,
     submit_timeout: Duration,
 }
 
@@ -656,23 +689,23 @@ impl ExecutionerEnvironment {
         let queue_dir = backend.queue_dir();
 
         let mut host = HostBackend::from_config(config.host)?;
-        let session = host
-            .create_session(CreateSessionRequest {
-                session_id: None,
+        let environment = host
+            .create_environment(CreateEnvironmentRequest {
+                environment_id: None,
                 workspace,
                 policy: config.policy.into_execution_policy(),
                 ttl_ms: config.lifecycle.ttl_ms,
                 metadata: Map::new(),
             })
             .await?
-            .session;
-        validate_session_id(&session.id)?;
+            .environment;
+        validate_environment_id(&environment.id)?;
         let host = Arc::new(host);
         let worker =
             WorkerDriver::from_config(config.worker, Arc::clone(&backend), Arc::clone(&host));
 
         Ok(Self {
-            session: session.into(),
+            environment: environment.into(),
             backend,
             queue_dir,
             host,
@@ -682,6 +715,89 @@ impl ExecutionerEnvironment {
         })
     }
 
+    pub fn environment(&self) -> &EnvironmentInfo {
+        &self.environment
+    }
+
+    pub async fn create_session(&self) -> Result<ExecutionerSession> {
+        self.create_session_with_policy(None).await
+    }
+
+    pub async fn create_session_with_policy(
+        &self,
+        policy: Option<PolicyConfig>,
+    ) -> Result<ExecutionerSession> {
+        let session = self
+            .host
+            .create_session(
+                &self.environment.id,
+                CreateSessionRequest {
+                    session_id: None,
+                    policy: policy.map(PolicyConfig::into_execution_policy),
+                    metadata: Map::new(),
+                },
+            )
+            .await?
+            .session;
+        validate_session_id(&session.id)?;
+        Ok(ExecutionerSession {
+            session: session.into(),
+            backend: Arc::clone(&self.backend),
+            host: Arc::clone(&self.host),
+            inline_worker: match &self.worker {
+                WorkerDriver::InProcess(worker) => Some(worker.clone()),
+                WorkerDriver::Managed(_) | WorkerDriver::External => None,
+            },
+            submit_timeout: self.submit_timeout,
+        })
+    }
+
+    pub async fn close(&self) -> Result<EnvironmentInfo> {
+        let worker_result = self.worker.shutdown().await;
+
+        let environment_result = match self.lifecycle.close_behavior {
+            CloseBehavior::DestroyEnvironment => {
+                self.host.destroy_environment(&self.environment.id).await
+            }
+            CloseBehavior::CloseEnvironment => {
+                self.host.close_environment(&self.environment.id).await
+            }
+        };
+
+        let cleanup_result: Result<()> =
+            if self.lifecycle.queue_cleanup == QueueCleanup::DeleteOnClose {
+                if let Some(queue_dir) = &self.queue_dir {
+                    cleanup_queue_dir(queue_dir)
+                } else {
+                    Ok(())
+                }
+            } else {
+                Ok(())
+            };
+
+        worker_result?;
+        match (environment_result, cleanup_result) {
+            (Ok(environment), Ok(())) => Ok(environment.into()),
+            (Err(err), _) => Err(err),
+            (Ok(_), Err(err)) => Err(err),
+        }
+    }
+
+    pub async fn export_workspace(&self) -> Result<WorkspaceArtifact> {
+        self.host.export_workspace(&self.environment.id).await
+    }
+
+    pub fn materialize_workspace_artifact(
+        &self,
+        artifact: &WorkspaceArtifact,
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        executioner_core::artifact::materialize_workspace_artifact(artifact, destination.as_ref())
+            .map_err(|err| SdkError::Host(err.to_string()))
+    }
+}
+
+impl ExecutionerSession {
     pub fn session(&self) -> &SessionInfo {
         &self.session
     }
@@ -726,43 +842,10 @@ impl ExecutionerEnvironment {
     }
 
     pub async fn close(&self) -> Result<SessionInfo> {
-        let worker_result = self.worker.shutdown().await;
-
-        let session_result = match self.lifecycle.close_behavior {
-            CloseBehavior::DestroySession => self.host.destroy_session(&self.session.id).await,
-            CloseBehavior::CloseSession => self.host.close_session(&self.session.id).await,
-        };
-
-        let cleanup_result: Result<()> =
-            if self.lifecycle.queue_cleanup == QueueCleanup::DeleteOnClose {
-                if let Some(queue_dir) = &self.queue_dir {
-                    cleanup_queue_dir(queue_dir)
-                } else {
-                    Ok(())
-                }
-            } else {
-                Ok(())
-            };
-
-        worker_result?;
-        match (session_result, cleanup_result) {
-            (Ok(session), Ok(())) => Ok(session.into()),
-            (Err(err), _) => Err(err),
-            (Ok(_), Err(err)) => Err(err),
-        }
-    }
-
-    pub async fn export_workspace(&self) -> Result<WorkspaceArtifact> {
-        self.host.export_workspace(&self.session.id).await
-    }
-
-    pub fn materialize_workspace_artifact(
-        &self,
-        artifact: &WorkspaceArtifact,
-        destination: impl AsRef<Path>,
-    ) -> Result<()> {
-        executioner_core::artifact::materialize_workspace_artifact(artifact, destination.as_ref())
-            .map_err(|err| SdkError::Host(err.to_string()))
+        self.host
+            .close_session(&self.session.id)
+            .await
+            .map(Into::into)
     }
 
     async fn wait_for_result(&self, invocation_id: &str, tool_name: &str) -> Result<SubmitResult> {
@@ -811,14 +894,11 @@ impl ExecutionerEnvironment {
                 });
             }
 
-            match &self.worker {
-                WorkerDriver::InProcess(worker) => {
-                    worker
-                        .run_once(&*self.backend, &*self.host)
-                        .await
-                        .map_err(|err| SdkError::Broker(err.to_string()))?;
-                }
-                WorkerDriver::Managed(_) | WorkerDriver::External => {}
+            if let Some(worker) = &self.inline_worker {
+                worker
+                    .run_once(&*self.backend, &*self.host)
+                    .await
+                    .map_err(|err| SdkError::Broker(err.to_string()))?;
             }
 
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1035,15 +1115,46 @@ impl HostBackend {
         }
     }
 
-    async fn create_session(
+    async fn create_environment(
         &mut self,
+        request: CreateEnvironmentRequest,
+    ) -> Result<CreateEnvironmentResponse> {
+        match self {
+            Self::InProcess(state) => state
+                .create_environment(request)
+                .map_err(|err| SdkError::Host(err.to_string())),
+            Self::Http(host) => host.create_environment(request).await,
+        }
+    }
+
+    async fn create_session(
+        &self,
+        environment_id: &str,
         request: CreateSessionRequest,
     ) -> Result<CreateSessionResponse> {
         match self {
             Self::InProcess(state) => state
-                .create_session(request)
+                .create_session(environment_id, request)
                 .map_err(|err| SdkError::Host(err.to_string())),
-            Self::Http(host) => host.create_session(request).await,
+            Self::Http(host) => host.create_session(environment_id, request).await,
+        }
+    }
+
+    async fn close_environment(&self, environment_id: &str) -> Result<Environment> {
+        match self {
+            Self::InProcess(state) => state
+                .close_environment(environment_id)
+                .map_err(|err| SdkError::Host(err.to_string())),
+            Self::Http(host) => host.close_environment(environment_id).await,
+        }
+    }
+
+    async fn destroy_environment(&self, environment_id: &str) -> Result<Environment> {
+        match self {
+            Self::InProcess(state) => state
+                .destroy_environment(environment_id)
+                .map_err(|err| SdkError::Host(err.to_string())),
+            Self::Http(host) => host.destroy_environment(environment_id).await,
         }
     }
 
@@ -1056,21 +1167,12 @@ impl HostBackend {
         }
     }
 
-    async fn destroy_session(&self, session_id: &str) -> Result<Session> {
+    async fn export_workspace(&self, environment_id: &str) -> Result<WorkspaceArtifact> {
         match self {
             Self::InProcess(state) => state
-                .destroy_session(session_id)
+                .export_workspace(environment_id)
                 .map_err(|err| SdkError::Host(err.to_string())),
-            Self::Http(host) => host.destroy_session(session_id).await,
-        }
-    }
-
-    async fn export_workspace(&self, session_id: &str) -> Result<WorkspaceArtifact> {
-        match self {
-            Self::InProcess(state) => state
-                .export_workspace(session_id)
-                .map_err(|err| SdkError::Host(err.to_string())),
-            Self::Http(host) => host.export_workspace(session_id).await,
+            Self::Http(host) => host.export_workspace(environment_id).await,
         }
     }
 }
@@ -1106,8 +1208,52 @@ impl HttpHostBackend {
         })
     }
 
-    async fn create_session(&self, request: CreateSessionRequest) -> Result<CreateSessionResponse> {
-        self.post_json("sessions", &request).await
+    async fn create_environment(
+        &self,
+        request: CreateEnvironmentRequest,
+    ) -> Result<CreateEnvironmentResponse> {
+        self.post_json("environments", &request).await
+    }
+
+    async fn create_session(
+        &self,
+        environment_id: &str,
+        request: CreateSessionRequest,
+    ) -> Result<CreateSessionResponse> {
+        validate_environment_id(environment_id)?;
+        self.post_json(&format!("environments/{environment_id}/sessions"), &request)
+            .await
+    }
+
+    async fn close_environment(&self, environment_id: &str) -> Result<Environment> {
+        validate_environment_id(environment_id)?;
+        self.post_json(
+            &format!("environments/{environment_id}/close"),
+            &Value::Null,
+        )
+        .await
+    }
+
+    async fn destroy_environment(&self, environment_id: &str) -> Result<Environment> {
+        validate_environment_id(environment_id)?;
+        let url = self
+            .base_url
+            .join(&format!("environments/{environment_id}"))
+            .map_err(|err| SdkError::Config(format!("invalid environment destroy url: {err}")))?;
+        let response = self
+            .client
+            .delete(url)
+            .send()
+            .await
+            .map_err(|err| SdkError::Transport(err.to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = capped_response_text(response, MAX_HTTP_ERROR_BODY_BYTES).await;
+            return Err(SdkError::Host(format!("host returned {status}: {text}")));
+        }
+        read_capped_json_response::<Environment>(response, MAX_HTTP_JSON_BODY_BYTES)
+            .await
+            .map_err(|err| SdkError::Transport(err.to_string()))
     }
 
     async fn close_session(&self, session_id: &str) -> Result<Session> {
@@ -1116,6 +1262,7 @@ impl HttpHostBackend {
             .await
     }
 
+    #[cfg(test)]
     async fn destroy_session(&self, session_id: &str) -> Result<Session> {
         validate_session_id(session_id)?;
         let url = self
@@ -1138,10 +1285,10 @@ impl HttpHostBackend {
             .map_err(|err| SdkError::Transport(err.to_string()))
     }
 
-    async fn export_workspace(&self, session_id: &str) -> Result<WorkspaceArtifact> {
-        validate_session_id(session_id)?;
+    async fn export_workspace(&self, environment_id: &str) -> Result<WorkspaceArtifact> {
+        validate_environment_id(environment_id)?;
         self.post_json(
-            &format!("sessions/{session_id}/artifacts/workspace"),
+            &format!("environments/{environment_id}/artifacts/workspace"),
             &Value::Null,
         )
         .await
@@ -1351,6 +1498,26 @@ impl From<Session> for SessionInfo {
     }
 }
 
+impl From<Environment> for EnvironmentInfo {
+    fn from(environment: Environment) -> Self {
+        Self {
+            id: environment.id,
+            state: environment.state.into(),
+            workspace: WorkspaceInfo {
+                root: environment.workspace.root,
+                logical_root: environment.workspace.logical_root,
+                mode: environment.workspace.mode.into(),
+                fresh: environment.workspace.fresh,
+                managed: environment.workspace.managed,
+            },
+            created_at: environment.created_at,
+            expires_at: environment.expires_at,
+            metadata: environment.metadata,
+            revision: environment.revision,
+        }
+    }
+}
+
 impl From<SessionState> for SessionStatus {
     fn from(state: SessionState) -> Self {
         match state {
@@ -1360,6 +1527,19 @@ impl From<SessionState> for SessionStatus {
             SessionState::Closed => Self::Closed,
             SessionState::Destroyed => Self::Destroyed,
             SessionState::Failed => Self::Failed,
+        }
+    }
+}
+
+impl From<EnvironmentState> for EnvironmentStatus {
+    fn from(state: EnvironmentState) -> Self {
+        match state {
+            EnvironmentState::Starting => Self::Starting,
+            EnvironmentState::Ready => Self::Ready,
+            EnvironmentState::Closing => Self::Closing,
+            EnvironmentState::Closed => Self::Closed,
+            EnvironmentState::Destroyed => Self::Destroyed,
+            EnvironmentState::Failed => Self::Failed,
         }
     }
 }
@@ -1496,6 +1676,10 @@ fn validate_session_id(session_id: &str) -> Result<()> {
     validate_identifier("session id", session_id)
 }
 
+fn validate_environment_id(environment_id: &str) -> Result<()> {
+    validate_identifier("environment id", environment_id)
+}
+
 fn validate_worker_id(worker_id: &str) -> Result<()> {
     validate_identifier("worker id", worker_id)
 }
@@ -1628,9 +1812,9 @@ fn validate_policy_roots(label: &str, roots: &[String]) -> Result<()> {
 
 fn validate_lifecycle_config(lifecycle: &LifecycleConfig) -> Result<()> {
     if let Some(ttl_ms) = lifecycle.ttl_ms {
-        if ttl_ms > MAX_SESSION_TTL_MS {
+        if ttl_ms > MAX_ENVIRONMENT_TTL_MS {
             return Err(SdkError::Config(format!(
-                "ttlMs exceeds maximum supported session TTL of {MAX_SESSION_TTL_MS}ms"
+                "ttlMs exceeds maximum supported environment TTL of {MAX_ENVIRONMENT_TTL_MS}ms"
             )));
         }
     }
@@ -1886,7 +2070,7 @@ mod tests {
         let queue = temp.path().join("queue");
         let state = temp.path().join("state");
         let mut config = EnvironmentConfig::local_file(&queue, &state);
-        config.lifecycle.ttl_ms = Some(MAX_SESSION_TTL_MS + 1);
+        config.lifecycle.ttl_ms = Some(MAX_ENVIRONMENT_TTL_MS + 1);
 
         let err = ExecutionerEnvironment::create(config).await.unwrap_err();
 
@@ -1925,8 +2109,9 @@ mod tests {
         ))
         .await
         .unwrap();
+        let session = env.create_session().await.unwrap();
 
-        let write = env
+        let write = session
             .submit(
                 ToolCall::json(
                     "Write",
@@ -1940,17 +2125,17 @@ mod tests {
         assert_eq!(write.status, ToolStatus::Success);
         assert_eq!(write.effects.len(), 1);
 
-        let read = env
+        let read = session
             .submit(ToolCall::json("Read", json!({ "path": "hello.txt" })).unwrap())
             .await
             .unwrap();
 
         assert_eq!(read.output, "hello from sdk");
-        let workspace_root = PathBuf::from(&env.session().workspace.root);
+        let workspace_root = PathBuf::from(&session.session().workspace.root);
         assert!(workspace_root.exists());
 
         let closed = env.close().await.unwrap();
-        assert_eq!(closed.state, SessionStatus::Destroyed);
+        assert_eq!(closed.state, EnvironmentStatus::Destroyed);
         assert!(!workspace_root.exists());
     }
 
@@ -1967,7 +2152,8 @@ mod tests {
             .unwrap();
 
         let env = ExecutionerEnvironment::create(config).await.unwrap();
-        assert_eq!(env.session().state, SessionStatus::Ready);
+        let session = env.create_session().await.unwrap();
+        assert_eq!(session.session().state, SessionStatus::Ready);
         env.close().await.unwrap();
     }
 
@@ -2013,7 +2199,7 @@ mod tests {
 
         assert!(close.to_string().contains("invalid session id"));
         assert!(destroy.to_string().contains("invalid session id"));
-        assert!(export.to_string().contains("invalid session id"));
+        assert!(export.to_string().contains("invalid environment id"));
         assert!(execute.to_string().contains("invalid session id"));
     }
 
@@ -2046,7 +2232,7 @@ mod tests {
             let bytes = socket.read(&mut buffer).await.unwrap();
             let request = String::from_utf8_lossy(&buffer[..bytes]);
             assert!(
-                request.starts_with("POST /api/sessions HTTP/1.1"),
+                request.starts_with("POST /api/environments HTTP/1.1"),
                 "{request}"
             );
             let response = "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
@@ -2055,8 +2241,8 @@ mod tests {
         let backend = HttpHostBackend::new(format!("http://{addr}/api")).unwrap();
 
         let _ = backend
-            .create_session(CreateSessionRequest {
-                session_id: None,
+            .create_environment(CreateEnvironmentRequest {
+                environment_id: None,
                 workspace: WorkspaceSpec {
                     mode: WorkspaceMode::New,
                     root: None,
@@ -2095,8 +2281,8 @@ mod tests {
         let backend = HttpHostBackend::new(format!("http://{addr}/")).unwrap();
 
         let err = backend
-            .create_session(CreateSessionRequest {
-                session_id: None,
+            .create_environment(CreateEnvironmentRequest {
+                environment_id: None,
                 workspace: WorkspaceSpec {
                     mode: WorkspaceMode::New,
                     root: None,
@@ -2151,8 +2337,8 @@ mod tests {
         let backend = HttpHostBackend::new(format!("http://{redirect_addr}/")).unwrap();
 
         let err = backend
-            .create_session(CreateSessionRequest {
-                session_id: Some("sess_redirect".to_string()),
+            .create_environment(CreateEnvironmentRequest {
+                environment_id: Some("env_redirect".to_string()),
                 workspace: WorkspaceSpec {
                     mode: WorkspaceMode::New,
                     root: None,
@@ -2172,7 +2358,7 @@ mod tests {
         assert!(err.to_string().contains("307"));
         assert!(
             !captured,
-            "redirect target received the create-session body"
+            "redirect target received the create-environment body"
         );
     }
 
@@ -2197,8 +2383,8 @@ mod tests {
         let backend = HttpHostBackend::new(format!("http://{addr}/")).unwrap();
 
         let err = backend
-            .create_session(CreateSessionRequest {
-                session_id: None,
+            .create_environment(CreateEnvironmentRequest {
+                environment_id: None,
                 workspace: WorkspaceSpec {
                     mode: WorkspaceMode::New,
                     root: None,
@@ -2218,7 +2404,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn environment_create_rejects_invalid_returned_session_id() {
+    async fn environment_create_rejects_invalid_returned_environment_id() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2228,7 +2414,7 @@ mod tests {
             let mut buffer = [0_u8; 2048];
             let _ = socket.read(&mut buffer).await.unwrap();
             let body = serde_json::json!({
-                "session": {
+                "environment": {
                     "id": "../escaped",
                     "state": "ready",
                     "workspace": {
@@ -2261,7 +2447,8 @@ mod tests {
                         "maxOutputBytes": 100000
                     },
                     "metadata": {},
-                    "createdAt": "now"
+                    "createdAt": "now",
+                    "revision": 0
                 }
             })
             .to_string();
@@ -2286,7 +2473,7 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert!(err.to_string().contains("invalid session id"));
+        assert!(err.to_string().contains("invalid environment id"));
         server.await.unwrap();
     }
 
@@ -2299,16 +2486,18 @@ mod tests {
         ))
         .await
         .unwrap();
+        let session = env.create_session().await.unwrap();
 
-        env.submit(
-            ToolCall::json(
-                "Write",
-                json!({ "path": "artifact.txt", "content": "hello" }),
+        session
+            .submit(
+                ToolCall::json(
+                    "Write",
+                    json!({ "path": "artifact.txt", "content": "hello" }),
+                )
+                .unwrap(),
             )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
+            .await
+            .unwrap();
 
         let artifact = env.export_workspace().await.unwrap();
 
@@ -2332,16 +2521,18 @@ mod tests {
         ))
         .await
         .unwrap();
+        let session = env.create_session().await.unwrap();
 
-        env.submit(
-            ToolCall::json(
-                "Write",
-                json!({ "path": "restore.txt", "content": "restored" }),
+        session
+            .submit(
+                ToolCall::json(
+                    "Write",
+                    json!({ "path": "restore.txt", "content": "restored" }),
+                )
+                .unwrap(),
             )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
+            .await
+            .unwrap();
 
         let artifact = env.export_workspace().await.unwrap();
         let destination = temp.path().join("restored-workspace");
@@ -2365,18 +2556,21 @@ mod tests {
         ))
         .await
         .unwrap();
+        let session = env.create_session().await.unwrap();
 
-        env.submit(ToolCall::json("Write", json!({ "path": "a.txt", "content": "a" })).unwrap())
+        session
+            .submit(ToolCall::json("Write", json!({ "path": "a.txt", "content": "a" })).unwrap())
             .await
             .unwrap();
-        env.submit(
-            ToolCall::json("Write", json!({ "path": "dir/b.txt", "content": "b" })).unwrap(),
-        )
-        .await
-        .unwrap();
+        session
+            .submit(
+                ToolCall::json("Write", json!({ "path": "dir/b.txt", "content": "b" })).unwrap(),
+            )
+            .await
+            .unwrap();
 
-        let root_files = env.list("/workspace").await.unwrap();
-        let dir_files = env.list_files("/workspace/dir").await.unwrap();
+        let root_files = session.list("/workspace").await.unwrap();
+        let dir_files = session.list_files("/workspace/dir").await.unwrap();
 
         assert_eq!(root_files, vec!["a.txt".to_string(), "dir/".to_string()]);
         assert_eq!(dir_files, vec!["b.txt".to_string()]);
@@ -2392,18 +2586,20 @@ mod tests {
         ))
         .await
         .unwrap();
+        let session = env.create_session().await.unwrap();
 
-        env.submit(
-            ToolCall::json(
-                "Write",
-                json!({ "path": "line\nbreak.txt", "content": "weird but legal" }),
+        session
+            .submit(
+                ToolCall::json(
+                    "Write",
+                    json!({ "path": "line\nbreak.txt", "content": "weird but legal" }),
+                )
+                .unwrap(),
             )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
+            .await
+            .unwrap();
 
-        let files = env.list_files("/workspace").await.unwrap();
+        let files = session.list_files("/workspace").await.unwrap();
 
         assert_eq!(files, vec!["line\nbreak.txt".to_string()]);
         env.close().await.unwrap();
@@ -2556,8 +2752,9 @@ mod tests {
         )
         .await
         .unwrap();
+        let session = env.create_session().await.unwrap();
 
-        let err = env.list_files("/workspace").await.unwrap_err();
+        let err = session.list_files("/workspace").await.unwrap_err();
 
         assert!(err.to_string().contains("List"));
         env.close().await.unwrap();
@@ -2578,8 +2775,9 @@ mod tests {
         )
         .await
         .unwrap();
+        let session = env.create_session().await.unwrap();
 
-        let err = env
+        let err = session
             .submit(ToolCall::new("", Map::new()).invocation_id("empty_tool"))
             .await
             .unwrap_err();
@@ -2604,8 +2802,9 @@ mod tests {
         )
         .await
         .unwrap();
+        let session = env.create_session().await.unwrap();
 
-        let err = env
+        let err = session
             .submit(
                 ToolCall::json("Read", serde_json::json!({ "path": "missing.txt" }))
                     .unwrap()
@@ -2635,8 +2834,9 @@ mod tests {
         )
         .await
         .unwrap();
+        let session = env.create_session().await.unwrap();
 
-        let err = env
+        let err = session
             .submit(
                 ToolCall::json("Read", serde_json::json!({ "path": "missing.txt" }))
                     .unwrap()
@@ -2666,8 +2866,9 @@ mod tests {
         )
         .await
         .unwrap();
+        let session = env.create_session().await.unwrap();
 
-        let err = env
+        let err = session
             .submit(
                 ToolCall::json("Read", serde_json::json!({ "path": "missing.txt" }))
                     .unwrap()
@@ -2695,7 +2896,8 @@ mod tests {
             .unwrap();
 
         let env = ExecutionerEnvironment::create(config).await.unwrap();
-        let write = env
+        let session = env.create_session().await.unwrap();
+        let write = session
             .submit(
                 ToolCall::json(
                     "Write",
@@ -2708,7 +2910,7 @@ mod tests {
 
         assert_eq!(write.status, ToolStatus::Success);
 
-        let read = env
+        let read = session
             .submit(ToolCall::json("Read", json!({ "path": "managed.txt" })).unwrap())
             .await
             .unwrap();
@@ -2751,8 +2953,9 @@ mod tests {
         )
         .await
         .unwrap();
+        let session = env.create_session().await.unwrap();
 
-        let write = env
+        let write = session
             .submit(
                 ToolCall::json(
                     "Write",
@@ -2764,7 +2967,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(write.status, ToolStatus::Success);
-        let read = env
+        let read = session
             .submit(ToolCall::json("Read", json!({ "path": "external.txt" })).unwrap())
             .await
             .unwrap();
@@ -2791,14 +2994,16 @@ mod tests {
         )
         .await
         .unwrap();
+        let session = env.create_session().await.unwrap();
         let invocation_id = "sdk_wrong_session";
         let submit = tokio::spawn(async move {
-            env.submit(
-                ToolCall::json("Read", json!({ "path": "missing.txt" }))
-                    .unwrap()
-                    .invocation_id(invocation_id),
-            )
-            .await
+            session
+                .submit(
+                    ToolCall::json("Read", json!({ "path": "missing.txt" }))
+                        .unwrap()
+                        .invocation_id(invocation_id),
+                )
+                .await
         });
 
         let pending_path = queue.join("pending/sdk_wrong_session.json");
@@ -2863,14 +3068,16 @@ mod tests {
         )
         .await
         .unwrap();
+        let session = env.create_session().await.unwrap();
         let invocation_id = "sdk_wrong_failed_session";
         let submit = tokio::spawn(async move {
-            env.submit(
-                ToolCall::json("Read", json!({ "path": "missing.txt" }))
-                    .unwrap()
-                    .invocation_id(invocation_id),
-            )
-            .await
+            session
+                .submit(
+                    ToolCall::json("Read", json!({ "path": "missing.txt" }))
+                        .unwrap()
+                        .invocation_id(invocation_id),
+                )
+                .await
         });
 
         let pending_path = queue.join("pending/sdk_wrong_failed_session.json");
@@ -2928,15 +3135,17 @@ mod tests {
         )
         .await
         .unwrap();
+        let session = env.create_session().await.unwrap();
         let invocation_id = "sdk_wrong_tool";
-        let session_id = env.session().id.clone();
+        let session_id = session.session().id.clone();
         let submit = tokio::spawn(async move {
-            env.submit(
-                ToolCall::json("List", json!({}))
-                    .unwrap()
-                    .invocation_id(invocation_id),
-            )
-            .await
+            session
+                .submit(
+                    ToolCall::json("List", json!({}))
+                        .unwrap()
+                        .invocation_id(invocation_id),
+                )
+                .await
         });
 
         let pending_path = queue.join("pending/sdk_wrong_tool.json");
@@ -3001,15 +3210,17 @@ mod tests {
         )
         .await
         .unwrap();
+        let session = env.create_session().await.unwrap();
         let invocation_id = "sdk_orphan_completed";
-        let session_id = env.session().id.clone();
+        let session_id = session.session().id.clone();
         let submit = tokio::spawn(async move {
-            env.submit(
-                ToolCall::json("Read", json!({ "path": "missing.txt" }))
-                    .unwrap()
-                    .invocation_id(invocation_id),
-            )
-            .await
+            session
+                .submit(
+                    ToolCall::json("Read", json!({ "path": "missing.txt" }))
+                        .unwrap()
+                        .invocation_id(invocation_id),
+                )
+                .await
         });
 
         let pending_path = queue.join("pending/sdk_orphan_completed.json");
@@ -3068,15 +3279,17 @@ mod tests {
         )
         .await
         .unwrap();
+        let session = env.create_session().await.unwrap();
         let invocation_id = "sdk_orphan_failed";
-        let session_id = env.session().id.clone();
+        let session_id = session.session().id.clone();
         let submit = tokio::spawn(async move {
-            env.submit(
-                ToolCall::json("Read", json!({ "path": "missing.txt" }))
-                    .unwrap()
-                    .invocation_id(invocation_id),
-            )
-            .await
+            session
+                .submit(
+                    ToolCall::json("Read", json!({ "path": "missing.txt" }))
+                        .unwrap()
+                        .invocation_id(invocation_id),
+                )
+                .await
         });
 
         let pending_path = queue.join("pending/sdk_orphan_failed.json");
@@ -3126,15 +3339,17 @@ mod tests {
             .unwrap();
 
         let env = ExecutionerEnvironment::create(config).await.unwrap();
-        env.submit(
-            ToolCall::json(
-                "Write",
-                json!({ "path": "kept.txt", "content": "preserve me" }),
+        let session = env.create_session().await.unwrap();
+        session
+            .submit(
+                ToolCall::json(
+                    "Write",
+                    json!({ "path": "kept.txt", "content": "preserve me" }),
+                )
+                .unwrap(),
             )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
+            .await
+            .unwrap();
 
         env.close().await.unwrap();
 
@@ -3194,7 +3409,7 @@ mod tests {
     async fn lifecycle_can_delete_queue_on_close() {
         let temp = tempfile::TempDir::new().unwrap();
         let queue = temp.path().join("queue");
-        let lifecycle = LifecycleConfig::destroy_session().delete_queue_on_close();
+        let lifecycle = LifecycleConfig::destroy_environment().delete_queue_on_close();
         let config = EnvironmentConfig::builder()
             .file_backend(queue.clone())
             .in_process_host(temp.path().join("state"))
@@ -3203,6 +3418,7 @@ mod tests {
             .unwrap();
 
         let env = ExecutionerEnvironment::create(config).await.unwrap();
+        let _session = env.create_session().await.unwrap();
         assert!(queue.exists());
         env.close().await.unwrap();
         assert!(!queue.exists());
@@ -3214,7 +3430,7 @@ mod tests {
         let queue = temp.path().join("queue");
         fs::create_dir_all(&queue).unwrap();
         fs::write(queue.join("sentinel.txt"), "do not delete").unwrap();
-        let lifecycle = LifecycleConfig::destroy_session().delete_queue_on_close();
+        let lifecycle = LifecycleConfig::destroy_environment().delete_queue_on_close();
         let config = EnvironmentConfig::builder()
             .file_backend(queue.clone())
             .in_process_host(temp.path().join("state"))
@@ -3223,6 +3439,7 @@ mod tests {
             .unwrap();
 
         let env = ExecutionerEnvironment::create(config).await.unwrap();
+        let _session = env.create_session().await.unwrap();
         env.close().await.unwrap();
 
         assert_eq!(
@@ -3241,7 +3458,7 @@ mod tests {
         fs::create_dir_all(&outside).unwrap();
         fs::write(queue.join("sentinel.txt"), "do not delete").unwrap();
         fs::write(outside.join("secret.txt"), "keep me").unwrap();
-        let lifecycle = LifecycleConfig::destroy_session().delete_queue_on_close();
+        let lifecycle = LifecycleConfig::destroy_environment().delete_queue_on_close();
         let config = EnvironmentConfig::builder()
             .file_backend(queue.clone())
             .in_process_host(temp.path().join("state"))
@@ -3250,6 +3467,7 @@ mod tests {
             .unwrap();
 
         let env = ExecutionerEnvironment::create(config).await.unwrap();
+        let _session = env.create_session().await.unwrap();
         fs::remove_dir_all(queue.join("pending")).unwrap();
         std::os::unix::fs::symlink(&outside, queue.join("pending")).unwrap();
         env.close().await.unwrap();
@@ -3276,7 +3494,7 @@ mod tests {
             fs::create_dir_all(outside.join(child)).unwrap();
         }
         fs::write(outside.join("pending/secret.txt"), "keep me").unwrap();
-        let lifecycle = LifecycleConfig::destroy_session().delete_queue_on_close();
+        let lifecycle = LifecycleConfig::destroy_environment().delete_queue_on_close();
         let config = EnvironmentConfig::builder()
             .file_backend(queue.clone())
             .in_process_host(temp.path().join("state"))
@@ -3285,6 +3503,7 @@ mod tests {
             .unwrap();
 
         let env = ExecutionerEnvironment::create(config).await.unwrap();
+        let _session = env.create_session().await.unwrap();
         fs::remove_dir_all(&queue).unwrap();
         std::os::unix::fs::symlink(&outside, &queue).unwrap();
         env.close().await.unwrap();
@@ -3303,9 +3522,9 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let session_body = serde_json::json!({
-                "session": {
-                    "id": "sess_close_failure",
+            let environment_body = serde_json::json!({
+                "environment": {
+                    "id": "env_close_failure",
                     "state": "ready",
                     "workspace": {
                         "root": "/tmp/workspace",
@@ -3337,15 +3556,16 @@ mod tests {
                         "maxOutputBytes": 100000
                     },
                     "metadata": {},
-                    "createdAt": "now"
+                    "createdAt": "now",
+                    "revision": 0
                 }
             })
             .to_string();
             let responses = [
                 format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                    session_body.len(),
-                    session_body
+                    environment_body.len(),
+                    environment_body
                 ),
                 "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 14\r\nconnection: close\r\n\r\ndestroy failed".to_string(),
             ];
@@ -3365,7 +3585,7 @@ mod tests {
                 .http_host(format!("http://{addr}/"))
                 .external_worker()
                 .new_workspace()
-                .lifecycle(LifecycleConfig::destroy_session().delete_queue_on_close())
+                .lifecycle(LifecycleConfig::destroy_environment().delete_queue_on_close())
                 .build()
                 .unwrap(),
         )

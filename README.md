@@ -78,34 +78,42 @@ does not need a local runtime binary.
 Minimal SDK usage:
 
 ```py
-from substrate import Environment
+from substrate import ExecutionerEnvironment
 
-with Environment.create(workspace="new", allow_commands=["ls"]) as env:
-    env.write("notes.txt", "hello")
-    print(env.read("notes.txt"))
-    print(env.bash("ls /workspace"))
+with ExecutionerEnvironment.create(
+    workspace={"kind": "new"},
+    policy={"process": {"allowExec": True, "allowedCommands": ["ls"]}},
+) as env:
+    session = env.create_session()
+    session.write("notes.txt", "hello")
+    print(session.read("notes.txt"))
+    print(session.bash("ls /workspace"))
 ```
 
 Minimal agent-loop shape:
 
 ```py
 from anthropic import Anthropic
-from substrate import Environment
+from substrate import ExecutionerEnvironment, tool_schemas
 
 client = Anthropic()
 messages = [{"role": "user", "content": "Create notes.txt and read it back."}]
 
-with Environment.create(workspace="new", allow_commands=["python", "pytest"]) as env:
+with ExecutionerEnvironment.create(
+    workspace={"kind": "new"},
+    policy={"process": {"allowExec": True, "allowedCommands": ["python", "pytest"]}},
+) as env:
+    session = env.create_session()
     response = client.messages.create(
         model="...",
         max_tokens=1024,
-        tools=env.tool_schemas(),
+        tools=tool_schemas(),
         messages=messages,
     )
 
     for block in response.content:
         if block.type == "tool_use":
-            result = env.execute({
+            result = session.execute({
                 "id": block.id,
                 "name": block.name,
                 "input": block.input,

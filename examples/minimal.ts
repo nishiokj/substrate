@@ -1,14 +1,15 @@
-import { Environment } from "@substrate/sdk";
+import { ExecutionerEnvironment } from "@substrate/sdk";
 
-const env = await Environment.create({
-  workspace: "new",
-  allowCommands: ["ls"],
+const env = await ExecutionerEnvironment.create({
+  workspace: { kind: "new" },
+  policy: { process: { allowExec: true, allowedCommands: ["ls"] } },
 });
+const session = await env.createSession();
 
 try {
-  await env.write("notes.txt", "hello");
-  console.log(await env.read("notes.txt"));
-  console.log(await env.bash("ls /workspace"));
+  await session.write("notes.txt", "hello");
+  console.log(await session.read("notes.txt"));
+  console.log(await session.bash("ls /workspace"));
 } finally {
   await env.close();
 }

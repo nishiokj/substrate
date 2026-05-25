@@ -16,7 +16,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal, Mapping, TypedDict, Union
+from typing import Any, Literal, Mapping, TypedDict
 from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
@@ -35,10 +35,12 @@ BackendKind = Literal["file"]
 ToolStatus = Literal["success", "error", "timeout", "cancelled", "policy_denied"]
 EffectOperation = Literal["read", "create", "update", "delete", "execute"]
 WorkspaceMode = Literal["new", "existing", "snapshot", "template"]
+EnvironmentState = Literal["starting", "ready", "closing", "closed", "destroyed", "failed"]
 SessionState = Literal["starting", "ready", "closing", "closed", "destroyed", "failed"]
 _TOOL_STATUSES = {"success", "error", "timeout", "cancelled", "policy_denied"}
 _EFFECT_OPERATIONS = {"read", "create", "update", "delete", "execute"}
 _WORKSPACE_MODES = {"new", "existing", "snapshot", "template"}
+_ENVIRONMENT_STATES = {"starting", "ready", "closing", "closed", "destroyed", "failed"}
 _SESSION_STATES = {"starting", "ready", "closing", "closed", "destroyed", "failed"}
 _RUNTIME_PACKAGE_NAMES = ("substrate_runtime", "executioner_runtime")
 
@@ -390,10 +392,6 @@ _TOOL_SCHEMAS: tuple[ToolSchema, ...] = (
 )
 
 
-FriendlyWorkspace = Union[Literal["new"], str, os.PathLike[str]]
-FriendlyHost = Union[Literal["local"], str, HostConfig]
-
-
 def tool(name: str, **arguments: Any) -> ToolCall:
     """Create a tool call without exposing the wire envelope shape."""
     if not isinstance(name, str) or not name:
@@ -497,6 +495,40 @@ class WorkspaceInfo:
             mode=mode,  # type: ignore[arg-type]
             fresh=_json_bool(_required_field(value, "fresh", "workspace fresh"), "workspace fresh"),
             managed=_json_bool(_required_field(value, "managed", "workspace managed"), "workspace managed"),
+        )
+
+
+@dataclass(frozen=True)
+class EnvironmentInfo:
+    id: str
+    state: EnvironmentState
+    workspace: WorkspaceInfo
+    createdAt: str
+    revision: int
+    expiresAt: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_json(cls, value: Mapping[str, Any]) -> "EnvironmentInfo":
+        value = _json_mapping(value, "environment")
+        _reject_unknown_fields(
+            value,
+            {"id", "state", "workspace", "policy", "createdAt", "expiresAt", "metadata", "revision"},
+            "environment",
+        )
+        if value.get("policy") is not None:
+            _json_mapping(value["policy"], "environment policy")
+        state = _json_string(_required_field(value, "state", "environment state"), "environment state")
+        if state not in _ENVIRONMENT_STATES:
+            raise ValueError(f"unknown environment state: {state}")
+        return cls(
+            id=_json_string(_required_field(value, "id", "environment id"), "environment id"),
+            state=state,  # type: ignore[arg-type]
+            workspace=WorkspaceInfo.from_json(_json_mapping(_required_field(value, "workspace", "environment workspace"), "environment workspace")),
+            createdAt=_json_string(_required_field(value, "createdAt", "environment createdAt"), "environment createdAt"),
+            revision=_json_non_negative_int(_required_field(value, "revision", "environment revision"), "environment revision"),
+            expiresAt=_json_optional_string(value.get("expiresAt"), "environment expiresAt"),
+            metadata=dict(_json_mapping(value.get("metadata", {}), "environment metadata")),
         )
 
 
@@ -622,7 +654,7 @@ class WorkspaceArtifactEntry:
 
 @dataclass(frozen=True)
 class WorkspaceArtifact:
-    sessionId: str
+    environmentId: str
     artifact: ResourceRef
     manifest: ResourceRef
     format: str
@@ -640,7 +672,7 @@ class WorkspaceArtifact:
         _reject_unknown_fields(
             value,
             {
-                "sessionId",
+                "environmentId",
                 "artifact",
                 "manifest",
                 "format",
@@ -655,7 +687,7 @@ class WorkspaceArtifact:
             "workspace artifact",
         )
         return cls(
-            sessionId=_json_string(_required_field(value, "sessionId", "artifact sessionId"), "artifact sessionId"),
+            environmentId=_json_string(_required_field(value, "environmentId", "artifact environmentId"), "artifact environmentId"),
             artifact=ResourceRef.from_json(_json_mapping(_required_field(value, "artifact", "artifact resource"), "artifact resource")),
             manifest=ResourceRef.from_json(_json_mapping(_required_field(value, "manifest", "artifact manifest"), "artifact manifest")),
             format=_json_string(_required_field(value, "format", "artifact format"), "artifact format"),
@@ -697,11 +729,11 @@ class ExecutionerEnvironment:
     def __init__(
         self,
         config: _RuntimeConfig,
-        session: SessionInfo,
+        environment: EnvironmentInfo,
         processes: list[_ManagedProcess],
     ) -> None:
         self._config = config
-        self._session = session
+        self._environment = environment
         self._processes = processes
 
     @classmethod
@@ -728,7 +760,7 @@ class ExecutionerEnvironment:
             submit_timeout_ms=submitTimeoutMs,
         )
         processes: list[_ManagedProcess] = []
-        session: SessionInfo | None = None
+        environment: EnvironmentInfo | None = None
 
         try:
             if runtime.host["kind"] == "managed":
@@ -748,7 +780,7 @@ class ExecutionerEnvironment:
                 _wait_for_health(runtime.baseUrl, runtime.submitTimeoutMs)
 
             _ensure_file_queue(runtime.queueDir)
-            session = _create_session(runtime)
+            environment = _create_environment(runtime)
 
             if runtime.worker["kind"] == "managed":
                 processes.append(
@@ -770,10 +802,75 @@ class ExecutionerEnvironment:
                     )
                 )
 
-            return cls(runtime, session, processes)
+            return cls(runtime, environment, processes)
         except Exception:
-            _cleanup_partial_create(runtime, processes, session)
+            _cleanup_partial_create(runtime, processes, environment)
             raise
+
+    @property
+    def environment(self) -> EnvironmentInfo:
+        return self._environment
+
+    def create_session(self, policy: PolicyConfig | None = None) -> "ExecutionerSession":
+        return ExecutionerSession(
+            self._config,
+            _create_session(self._config, self._environment.id, policy),
+        )
+
+    def export_workspace(self) -> WorkspaceArtifact:
+        _assert_environment_id(self._environment.id)
+        artifact = _post_json(
+            f"{self._config.baseUrl}environments/{self._environment.id}/artifacts/workspace",
+            None,
+        )
+        return WorkspaceArtifact.from_json(artifact)
+
+    def materialize_workspace_artifact(
+        self,
+        artifact: WorkspaceArtifact,
+        destination: str | os.PathLike[str],
+    ) -> None:
+        materialize_workspace_artifact(artifact, destination)
+
+    def close(self) -> EnvironmentInfo:
+        _assert_environment_id(self._environment.id)
+        worker_processes = [
+            managed for managed in self._processes if managed.name != "executioner-host"
+        ]
+        host_processes = [
+            managed for managed in self._processes if managed.name == "executioner-host"
+        ]
+        for managed in reversed(worker_processes):
+            _terminate_process(managed)
+
+        try:
+            if self._config.lifecycle["destroyOnClose"]:
+                environment_data = _delete_json(f"{self._config.baseUrl}environments/{self._environment.id}")
+            else:
+                environment_data = _post_json(f"{self._config.baseUrl}environments/{self._environment.id}/close", None)
+            environment = EnvironmentInfo.from_json(environment_data)
+        finally:
+            for managed in reversed(host_processes):
+                _terminate_process(managed)
+
+            if self._config.lifecycle["cleanupQueueOnClose"]:
+                _cleanup_queue_dir(self._config.queueDir, self._config.sdkCreatedQueueDir)
+            if self._config.lifecycle["cleanupStateOnClose"] and self._config.host["kind"] == "managed":
+                _cleanup_state_dir(self._config.host["stateDir"], self._config.sdkCreatedStateDir)
+
+        return environment
+
+    def __enter__(self) -> "ExecutionerEnvironment":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.close()
+
+
+class ExecutionerSession:
+    def __init__(self, config: _RuntimeConfig, session: SessionInfo) -> None:
+        self._config = config
+        self._session = session
 
     @property
     def session(self) -> SessionInfo:
@@ -906,151 +1003,11 @@ class ExecutionerEnvironment:
     def list(self, cwd: str = "/workspace") -> list[str]:
         return self.list_files(cwd)
 
-    def export_workspace(self) -> WorkspaceArtifact:
-        _assert_session_id(self._session.id)
-        artifact = _post_json(
-            f"{self._config.baseUrl}sessions/{self._session.id}/artifacts/workspace",
-            None,
-        )
-        return WorkspaceArtifact.from_json(artifact)
-
-    def materialize_workspace_artifact(
-        self,
-        artifact: WorkspaceArtifact,
-        destination: str | os.PathLike[str],
-    ) -> None:
-        materialize_workspace_artifact(artifact, destination)
-
     def close(self) -> SessionInfo:
         _assert_session_id(self._session.id)
-        worker_processes = [
-            managed for managed in self._processes if managed.name != "executioner-host"
-        ]
-        host_processes = [
-            managed for managed in self._processes if managed.name == "executioner-host"
-        ]
-        for managed in reversed(worker_processes):
-            _terminate_process(managed)
-
-        try:
-            if self._config.lifecycle["destroyOnClose"]:
-                session_data = _delete_json(f"{self._config.baseUrl}sessions/{self._session.id}")
-            else:
-                session_data = _post_json(f"{self._config.baseUrl}sessions/{self._session.id}/close", None)
-            session = SessionInfo.from_json(session_data)
-        finally:
-            for managed in reversed(host_processes):
-                _terminate_process(managed)
-
-            if self._config.lifecycle["cleanupQueueOnClose"]:
-                _cleanup_queue_dir(self._config.queueDir, self._config.sdkCreatedQueueDir)
-            if self._config.lifecycle["cleanupStateOnClose"] and self._config.host["kind"] == "managed":
-                _cleanup_state_dir(self._config.host["stateDir"], self._config.sdkCreatedStateDir)
-
-        return session
-
-    def __enter__(self) -> "ExecutionerEnvironment":
-        return self
-
-    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
-        self.close()
-
-
-class Executioner:
-    """Friendly SDK facade for creating local or remote execution environments."""
-
-    @classmethod
-    def create(
-        cls,
-        *,
-        workspace: FriendlyWorkspace | WorkspaceConfig = "new",
-        host: FriendlyHost = "local",
-        allow_commands: list[str] | None = None,
-        env: Mapping[str, str] | None = None,
-        policy: PolicyConfig | None = None,
-        lifecycle: LifecycleConfig | None = None,
-        binary_path: str | None = None,
-        submit_timeout_ms: int | None = None,
-        advanced: Mapping[str, Any] | None = None,
-    ) -> ExecutionerEnvironment:
-        advanced_config = dict(advanced or {})
-        _reject_unknown_fields(
-            advanced_config,
-            {"backend", "worker", "binaryPath", "binary_path", "submitTimeoutMs", "submit_timeout_ms"},
-            "advanced",
+        return SessionInfo.from_json(
+            _post_json(f"{self._config.baseUrl}sessions/{self._session.id}/close", None)
         )
-        return ExecutionerEnvironment.create(
-            binaryPath=(
-                binary_path
-                or advanced_config.get("binaryPath")
-                or advanced_config.get("binary_path")
-            ),
-            backend=advanced_config.get("backend"),
-            host=_friendly_host(host),
-            worker=advanced_config.get("worker"),
-            workspace=_friendly_workspace(workspace),
-            policy=_friendly_policy(policy, allow_commands=allow_commands, env=env),
-            lifecycle=lifecycle,
-            submitTimeoutMs=(
-                submit_timeout_ms
-                or advanced_config.get("submitTimeoutMs")
-                or advanced_config.get("submit_timeout_ms")
-            ),
-        )
-
-
-Environment = Executioner
-
-
-def _friendly_workspace(workspace: FriendlyWorkspace | WorkspaceConfig) -> WorkspaceConfig:
-    if isinstance(workspace, Mapping):
-        return dict(workspace)  # type: ignore[return-value]
-    if workspace == "new":
-        return {"kind": "new"}
-    return {
-        "kind": "existing",
-        "root": str(Path(os.fspath(workspace)).expanduser().resolve()),
-    }
-
-
-def _friendly_host(host: FriendlyHost) -> HostConfig:
-    if isinstance(host, Mapping):
-        return dict(host)  # type: ignore[return-value]
-    if host == "local":
-        return {"kind": "managed"}
-    if isinstance(host, str) and (host.startswith("http://") or host.startswith("https://")):
-        return {"kind": "http", "baseUrl": host}
-    raise ValueError("host must be 'local', an HTTP(S) URL, or a host config object")
-
-
-def _friendly_policy(
-    policy: PolicyConfig | None,
-    *,
-    allow_commands: list[str] | None,
-    env: Mapping[str, str] | None,
-) -> PolicyConfig | None:
-    if policy is None and allow_commands is None and env is None:
-        return None
-
-    resolved: dict[str, Any] = dict(policy or {})
-    for nested_key in ("process", "network", "env"):
-        if isinstance(resolved.get(nested_key), Mapping):
-            resolved[nested_key] = dict(resolved[nested_key])
-
-    if allow_commands is not None:
-        process = dict(resolved.get("process", {}))
-        process["allowExec"] = True
-        process["allowedCommands"] = list(allow_commands)
-        resolved["process"] = process
-
-    if env is not None:
-        env_policy = dict(resolved.get("env", {}))
-        injected = dict(env_policy.get("injected", {}))
-        injected.update(dict(env))
-        env_policy["injected"] = injected
-        resolved["env"] = env_policy
-
-    return resolved  # type: ignore[return-value]
 
 
 def _normalize_agent_tool_call(tool_call: Mapping[str, Any]) -> ToolCall:
@@ -1073,7 +1030,7 @@ def _normalize_agent_tool_call(tool_call: Mapping[str, Any]) -> ToolCall:
 def _cleanup_partial_create(
     runtime: _RuntimeConfig,
     processes: list[_ManagedProcess],
-    session: SessionInfo | None,
+    environment: EnvironmentInfo | None,
 ) -> None:
     worker_processes = [
         managed for managed in processes if managed.name != "executioner-host"
@@ -1084,12 +1041,12 @@ def _cleanup_partial_create(
     for managed in reversed(worker_processes):
         _terminate_process(managed)
     try:
-        if session is not None and _SESSION_ID_RE.match(session.id):
+        if environment is not None and _SESSION_ID_RE.match(environment.id):
             try:
                 if runtime.lifecycle["destroyOnClose"]:
-                    _delete_json(f"{runtime.baseUrl}sessions/{session.id}")
+                    _delete_json(f"{runtime.baseUrl}environments/{environment.id}")
                 else:
-                    _post_json(f"{runtime.baseUrl}sessions/{session.id}/close", None)
+                    _post_json(f"{runtime.baseUrl}environments/{environment.id}/close", None)
             except Exception:
                 pass
     finally:
@@ -1260,7 +1217,7 @@ def _validate_policy_roots(roots: list[str], label: str) -> None:
             raise ValueError(f"{label} entries must be /workspace logical roots without . or .. components")
 
 
-def _create_session(config: _RuntimeConfig) -> SessionInfo:
+def _create_environment(config: _RuntimeConfig) -> EnvironmentInfo:
     workspace = (
         {
             "mode": "existing",
@@ -1274,16 +1231,40 @@ def _create_session(config: _RuntimeConfig) -> SessionInfo:
         }
     )
     response = _post_json(
-        f"{config.baseUrl}sessions",
+        f"{config.baseUrl}environments",
         {
             "workspace": workspace,
             "policy": config.policy,
             "metadata": {},
         },
     )
+    environment = _parse_create_environment_response(response)
+    _assert_environment_id(environment.id)
+    return environment
+
+
+def _create_session(
+    config: _RuntimeConfig,
+    environment_id: str,
+    policy: PolicyConfig | None = None,
+) -> SessionInfo:
+    _assert_environment_id(environment_id)
+    response = _post_json(
+        f"{config.baseUrl}environments/{environment_id}/sessions",
+        {
+            "policy": None if policy is None else _materialize_policy(policy),
+            "metadata": {},
+        },
+    )
     session = _parse_create_session_response(response)
     _assert_session_id(session.id)
     return session
+
+
+def _parse_create_environment_response(value: Mapping[str, Any]) -> EnvironmentInfo:
+    response = _json_mapping(value, "create environment response")
+    _reject_unknown_fields(response, {"environment"}, "create environment response")
+    return EnvironmentInfo.from_json(_json_mapping(_required_field(response, "environment", "environment"), "environment"))
 
 
 def _parse_create_session_response(value: Mapping[str, Any]) -> SessionInfo:
@@ -1606,6 +1587,11 @@ def _assert_invocation_id(invocation_id: str) -> None:
 def _assert_session_id(session_id: str) -> None:
     if not isinstance(session_id, str) or not _SESSION_ID_RE.match(session_id):
         raise ValueError("invalid session id: only ASCII letters, numbers, '-' and '_' are allowed")
+
+
+def _assert_environment_id(environment_id: str) -> None:
+    if not isinstance(environment_id, str) or not _SESSION_ID_RE.match(environment_id):
+        raise ValueError("invalid environment id: only ASCII letters, numbers, '-' and '_' are allowed")
 
 
 def _ensure_invocation_id_unused(queue_dir: str, invocation_id: str) -> None:

@@ -20,7 +20,7 @@ SDKs resolve the runtime binary in this order:
 Remote-host usage does not require a local runtime binary:
 
 ```ts
-await Environment.create({
+await ExecutionerEnvironment.create({
   host: { kind: 'http', baseUrl: 'http://127.0.0.1:8765' },
   worker: { kind: 'external' },
 });
@@ -29,7 +29,7 @@ await Environment.create({
 Local managed usage starts the runtime binary automatically:
 
 ```ts
-await Environment.create({ workspace: 'new' });
+await ExecutionerEnvironment.create({ workspace: { kind: 'new' } });
 ```
 
 ## Registry Shape

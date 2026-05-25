@@ -14,23 +14,24 @@ bundled `executioner_sdk/bin/executioner`, an installed `substrate-runtime`
 package, or `executioner` on `PATH`. Remote-host usage does not need a local
 runtime.
 
-The public API exposes a small environment facade:
+The public API separates environment lifetime from session lifetime:
 
 ```py
-from substrate import Environment
+from substrate import ExecutionerEnvironment
 
-with Environment.create(workspace="new", allow_commands=["ls"]) as env:
-    env.write("hello.txt", "hello")
-    print(env.read("hello.txt"))
+with ExecutionerEnvironment.create(workspace={"kind": "new"}, policy={"process": {"allowExec": True, "allowedCommands": ["ls"]}}) as env:
+    session = env.create_session()
+    session.write("hello.txt", "hello")
+    print(session.read("hello.txt"))
 
-    env.edit({
+    session.edit({
         "path": "hello.txt",
         "oldString": "hello",
         "newString": "hello from Substrate",
     })
 
-    print(env.bash("ls /workspace"))
-    files = env.list()
+    print(session.bash("ls /workspace"))
+    files = session.list()
     artifact = env.export_workspace()
     env.materialize_workspace_artifact(artifact, "/tmp/restored-workspace")
 ```
@@ -40,22 +41,26 @@ matching tool-use blocks directly:
 
 ```py
 from anthropic import Anthropic
-from substrate import Environment
+from substrate import ExecutionerEnvironment, tool_schemas
 
 client = Anthropic()
 messages = [{"role": "user", "content": "Create notes.txt and read it back."}]
 
-with Environment.create(workspace="new", allow_commands=["python", "pytest"]) as env:
+with ExecutionerEnvironment.create(
+    workspace={"kind": "new"},
+    policy={"process": {"allowExec": True, "allowedCommands": ["python", "pytest"]}},
+) as env:
+    session = env.create_session()
     response = client.messages.create(
         model="...",
         max_tokens=1024,
-        tools=env.tool_schemas(),
+        tools=tool_schemas(),
         messages=messages,
     )
 
     for block in response.content:
         if block.type == "tool_use":
-            result = env.execute({
+            result = session.execute({
                 "id": block.id,
                 "name": block.name,
                 "input": block.input,
@@ -70,6 +75,6 @@ with Environment.create(workspace="new", allow_commands=["python", "pytest"]) as
             })
 ```
 
-The package hides the file-backed queue and worker transport behind the facade.
-`ExecutionerEnvironment.create(...)` remains available for advanced host,
-worker, and backend configuration.
+The package hides the file-backed queue and worker transport, but keeps
+environment and session lifecycles explicit. Multiple sessions can attach to the
+same environment.

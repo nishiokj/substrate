@@ -1,5 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { Environment, type ToolSchema } from "@substrate/sdk";
+import { ExecutionerEnvironment, toolSchemas, type ToolSchema } from "@substrate/sdk";
 
 const client = new Anthropic();
 const model = process.env.ANTHROPIC_MODEL;
@@ -8,10 +8,11 @@ if (!model) {
   throw new Error("Set ANTHROPIC_MODEL before running this example.");
 }
 
-const env = await Environment.create({
-  workspace: "new",
-  allowCommands: ["python", "pytest"],
+const env = await ExecutionerEnvironment.create({
+  workspace: { kind: "new" },
+  policy: { process: { allowExec: true, allowedCommands: ["python", "pytest"] } },
 });
+const session = await env.createSession();
 
 function anthropicTools(schemas: ToolSchema[]) {
   return schemas.map((schema) => ({
@@ -30,7 +31,7 @@ try {
   const response = await client.messages.create({
     model,
     max_tokens: 1024,
-    tools: anthropicTools(env.toolSchemas()),
+    tools: anthropicTools(toolSchemas()),
     messages,
   });
 
@@ -42,7 +43,7 @@ try {
       continue;
     }
 
-    const result = await env.execute({
+    const result = await session.execute({
       id: block.id,
       name: block.name,
       input: block.input,
@@ -59,7 +60,7 @@ try {
     const final = await client.messages.create({
       model,
       max_tokens: 1024,
-      tools: anthropicTools(env.toolSchemas()),
+      tools: anthropicTools(toolSchemas()),
       messages,
     });
     console.log(final.content[0].type === "text" ? final.content[0].text : final.content);

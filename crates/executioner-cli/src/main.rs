@@ -1,9 +1,6 @@
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
-use executioner_core::{
-    CreateSessionRequest, ExecutionPolicy, NetworkPolicy, ProcessPolicy, ToolInvocationRequest,
-    WorkspaceMode, WorkspaceSpec,
-};
+use executioner_core::{CreateSessionRequest, ToolInvocationRequest};
 use executioner_host::serve;
 use executioner_sdk::{ExecutionerEnvironment, ToolCall};
 use executioner_worker::{FileBroker, HttpHostClient, Worker};
@@ -64,16 +61,14 @@ enum SessionCommand {
     Create {
         #[arg(long, default_value = "http://127.0.0.1:8765/")]
         host_url: String,
-        #[arg(long, default_value = "new")]
-        mode: String,
         #[arg(long)]
-        root: Option<String>,
+        environment_id: String,
     },
     Export {
         #[arg(long, default_value = "http://127.0.0.1:8765/")]
         host_url: String,
         #[arg(long)]
-        session_id: String,
+        environment_id: String,
     },
 }
 
@@ -122,35 +117,31 @@ async fn main() -> anyhow::Result<()> {
         Command::Session { command } => match command {
             SessionCommand::Create {
                 host_url,
-                mode,
-                root,
+                environment_id,
             } => {
                 let request = CreateSessionRequest {
                     session_id: None,
-                    workspace: WorkspaceSpec {
-                        mode: parse_workspace_mode(&mode)?,
-                        root,
-                        snapshot_ref: None,
-                        template_ref: None,
-                        mount_as_workspace: true,
-                    },
-                    policy: default_policy(),
-                    ttl_ms: None,
+                    policy: None,
                     metadata: Map::new(),
                 };
                 let base_url = normalize_url(&host_url)?;
-                let response: Value = post_json(&base_url, "sessions", &request).await?;
+                let response: Value = post_json(
+                    &base_url,
+                    &format!("environments/{environment_id}/sessions"),
+                    &request,
+                )
+                .await?;
                 println!("{}", serde_json::to_string_pretty(&response)?);
             }
             SessionCommand::Export {
                 host_url,
-                session_id,
+                environment_id,
             } => {
-                validate_session_id(&session_id)?;
+                validate_session_id(&environment_id)?;
                 let base_url = normalize_url(&host_url)?;
                 let response: Value = post_empty(
                     &base_url,
-                    &format!("sessions/{session_id}/artifacts/workspace"),
+                    &format!("environments/{environment_id}/artifacts/workspace"),
                 )
                 .await?;
                 println!("{}", serde_json::to_string_pretty(&response)?);
@@ -230,26 +221,28 @@ async fn main() -> anyhow::Result<()> {
                 };
 
                 let env = ExecutionerEnvironment::create(builder.build()?).await?;
-                env.submit(ToolCall::new(
-                    "Write",
-                    object(serde_json::json!({
-                        "path": "executioner-smoke.txt",
-                        "content": "hello from executioner sdk"
-                    }))?,
-                ))
-                .await?;
-                let result = env
+                let session = env.create_session().await?;
+                session
+                    .submit(ToolCall::new(
+                        "Write",
+                        object(serde_json::json!({
+                            "path": "executioner-smoke.txt",
+                            "content": "hello from executioner sdk"
+                        }))?,
+                    ))
+                    .await?;
+                let result = session
                     .submit(ToolCall::new(
                         "Read",
                         object(serde_json::json!({ "path": "executioner-smoke.txt" }))?,
                     ))
                     .await?;
-                let session = env.close().await?;
+                let environment = env.close().await?;
 
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
-                        "session": session,
+                        "environment": environment,
                         "result": result,
                     }))?
                 );
@@ -257,33 +250,6 @@ async fn main() -> anyhow::Result<()> {
         },
     }
     Ok(())
-}
-
-fn default_policy() -> ExecutionPolicy {
-    ExecutionPolicy {
-        read_roots: vec!["/workspace".to_string()],
-        write_roots: vec!["/workspace".to_string()],
-        process: ProcessPolicy {
-            allow_exec: false,
-            allowed_commands: vec![],
-            denied_commands: vec![],
-            max_processes: None,
-        },
-        network: NetworkPolicy {
-            enabled: false,
-            allow_hosts: vec![],
-            deny_hosts: vec![],
-        },
-        ..ExecutionPolicy::default()
-    }
-}
-
-fn parse_workspace_mode(mode: &str) -> anyhow::Result<WorkspaceMode> {
-    match mode {
-        "new" => Ok(WorkspaceMode::New),
-        "existing" => Ok(WorkspaceMode::Existing),
-        other => anyhow::bail!("unsupported workspace mode: {other}"),
-    }
 }
 
 fn normalize_url(url: &str) -> anyhow::Result<Url> {

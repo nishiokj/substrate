@@ -11,6 +11,7 @@ flowchart LR
     Worker[Outbound worker] --> Broker
     Worker --> Host[Stateful tool host]
 
+    Host --> Environments[(Environment registry)]
     Host --> Sessions[(Session registry)]
     Host --> Workspace[/Workspace root/]
     Host --> Tools[Tool executors]
@@ -23,7 +24,8 @@ flowchart LR
 
 The standalone Rust workspace owns:
 
-- Session creation, attachment, closure, and destruction.
+- Environment creation, attachment, closure, and destruction.
+- Session creation, attachment, closure, and destruction within environments.
 - Workspace root resolution and `/workspace` logical path mapping.
 - Tool invocation execution.
 - Policy enforcement for filesystem, process, and environment access.
@@ -72,7 +74,8 @@ machine or container as the workspace it controls.
 
 Responsibilities:
 
-- Create a session-scoped workspace.
+- Create an environment-scoped workspace.
+- Attach one or more sessions to that environment.
 - Bind the workspace to a stable logical root: `/workspace`.
 - Validate and normalize paths.
 - Execute primitive tools.

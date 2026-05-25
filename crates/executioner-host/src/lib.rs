@@ -5,8 +5,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use executioner_core::{
-    CreateSessionRequest, ErrorEnvelope, ExecutionerError, HostState, Session,
-    ToolInvocationRequest, ToolInvocationResult,
+    CreateEnvironmentRequest, CreateSessionRequest, Environment, ErrorEnvelope, ExecutionerError,
+    HostState, Session, ToolInvocationRequest, ToolInvocationResult,
 };
 use serde::Serialize;
 use std::net::SocketAddr;
@@ -26,7 +26,24 @@ impl HostServer {
     pub fn router(self) -> Router {
         Router::new()
             .route("/health", get(health))
-            .route("/sessions", post(create_session))
+            .route("/environments", post(create_environment))
+            .route(
+                "/environments/{environment_id}",
+                get(get_environment).delete(delete_environment),
+            )
+            .route(
+                "/environments/{environment_id}/close",
+                post(close_environment),
+            )
+            .route(
+                "/environments/{environment_id}/sessions",
+                post(create_environment_session),
+            )
+            .route("/environments/{environment_id}/effects", get(get_effects))
+            .route(
+                "/environments/{environment_id}/artifacts/workspace",
+                post(export_workspace),
+            )
             .route(
                 "/sessions/{session_id}",
                 get(get_session).delete(delete_session),
@@ -35,11 +52,6 @@ impl HostServer {
             .route(
                 "/sessions/{session_id}/invocations",
                 post(execute_invocation),
-            )
-            .route("/sessions/{session_id}/effects", get(get_effects))
-            .route(
-                "/sessions/{session_id}/artifacts/workspace",
-                post(export_workspace),
             )
             .layer(DefaultBodyLimit::max(MAX_HTTP_REQUEST_BODY_BYTES))
             .with_state(self.state)
@@ -56,12 +68,42 @@ async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": true }))
 }
 
-async fn create_session(
+async fn create_environment(
     State(state): State<HostState>,
+    payload: Result<Json<CreateEnvironmentRequest>, JsonRejection>,
+) -> Result<Json<executioner_core::CreateEnvironmentResponse>, ApiError> {
+    let Json(request) = payload.map_err(json_rejection)?;
+    Ok(Json(state.create_environment(request)?))
+}
+
+async fn get_environment(
+    State(state): State<HostState>,
+    Path(environment_id): Path<String>,
+) -> Result<Json<Environment>, ApiError> {
+    Ok(Json(state.get_environment(&environment_id)?))
+}
+
+async fn close_environment(
+    State(state): State<HostState>,
+    Path(environment_id): Path<String>,
+) -> Result<Json<Environment>, ApiError> {
+    Ok(Json(state.close_environment(&environment_id)?))
+}
+
+async fn delete_environment(
+    State(state): State<HostState>,
+    Path(environment_id): Path<String>,
+) -> Result<Json<Environment>, ApiError> {
+    Ok(Json(state.destroy_environment(&environment_id)?))
+}
+
+async fn create_environment_session(
+    State(state): State<HostState>,
+    Path(environment_id): Path<String>,
     payload: Result<Json<CreateSessionRequest>, JsonRejection>,
 ) -> Result<Json<executioner_core::CreateSessionResponse>, ApiError> {
     let Json(request) = payload.map_err(json_rejection)?;
-    Ok(Json(state.create_session(request)?))
+    Ok(Json(state.create_session(&environment_id, request)?))
 }
 
 async fn get_session(
@@ -103,16 +145,16 @@ async fn execute_invocation(
 
 async fn get_effects(
     State(state): State<HostState>,
-    Path(session_id): Path<String>,
+    Path(environment_id): Path<String>,
 ) -> Result<Json<Vec<executioner_core::Effect>>, ApiError> {
-    Ok(Json(state.effects(&session_id)?))
+    Ok(Json(state.effects(&environment_id)?))
 }
 
 async fn export_workspace(
     State(state): State<HostState>,
-    Path(session_id): Path<String>,
+    Path(environment_id): Path<String>,
 ) -> Result<Json<executioner_core::WorkspaceArtifact>, ApiError> {
-    Ok(Json(state.export_workspace(&session_id)?))
+    Ok(Json(state.export_workspace(&environment_id)?))
 }
 
 fn json_rejection(rejection: JsonRejection) -> ApiError {
@@ -214,12 +256,41 @@ mod tests {
         body["error"]["code"].as_str().unwrap().to_string()
     }
 
+    fn create_test_session(state: &HostState) -> executioner_core::Session {
+        state
+            .create_environment(executioner_core::CreateEnvironmentRequest {
+                environment_id: Some("env".to_string()),
+                workspace: WorkspaceSpec {
+                    mode: WorkspaceMode::New,
+                    root: None,
+                    snapshot_ref: None,
+                    template_ref: None,
+                    mount_as_workspace: true,
+                },
+                policy: policy(),
+                ttl_ms: None,
+                metadata: serde_json::Map::new(),
+            })
+            .unwrap();
+        state
+            .create_session(
+                "env",
+                executioner_core::CreateSessionRequest {
+                    session_id: Some("sess".to_string()),
+                    policy: None,
+                    metadata: serde_json::Map::new(),
+                },
+            )
+            .unwrap()
+            .session
+    }
+
     #[tokio::test]
-    async fn creates_session_over_http_router() {
+    async fn creates_environment_over_http_router() {
         let temp = TempDir::new().unwrap();
         let app = HostServer::new(HostState::new(temp.path()).unwrap()).router();
-        let body = serde_json::to_vec(&executioner_core::CreateSessionRequest {
-            session_id: None,
+        let body = serde_json::to_vec(&executioner_core::CreateEnvironmentRequest {
+            environment_id: None,
             workspace: WorkspaceSpec {
                 mode: WorkspaceMode::New,
                 root: None,
@@ -237,9 +308,51 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/sessions")
+                    .uri("/environments")
                     .header("content-type", "application/json")
                     .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn creates_session_inside_environment_over_http_router() {
+        let temp = TempDir::new().unwrap();
+        let app = HostServer::new(HostState::new(temp.path()).unwrap()).router();
+        let environment_body = json!({
+            "environmentId": "env_http",
+            "workspace": {
+                "mode": "new",
+                "mountAsWorkspace": true
+            },
+            "policy": policy()
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/environments")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&environment_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let session_body = json!({ "sessionId": "sess_http" });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/environments/env_http/sessions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&session_body).unwrap()))
                     .unwrap(),
             )
             .await
@@ -252,22 +365,7 @@ mod tests {
     async fn runs_write_then_read_over_router() {
         let temp = TempDir::new().unwrap();
         let state = HostState::new(temp.path()).unwrap();
-        let session = state
-            .create_session(executioner_core::CreateSessionRequest {
-                session_id: Some("sess".to_string()),
-                workspace: WorkspaceSpec {
-                    mode: WorkspaceMode::New,
-                    root: None,
-                    snapshot_ref: None,
-                    template_ref: None,
-                    mount_as_workspace: true,
-                },
-                policy: policy(),
-                ttl_ms: None,
-                metadata: serde_json::Map::new(),
-            })
-            .unwrap()
-            .session;
+        let session = create_test_session(&state);
 
         let app = HostServer::new(state).router();
         let write_body = json!({
@@ -296,21 +394,7 @@ mod tests {
     async fn rejects_invocation_body_session_mismatch() {
         let temp = TempDir::new().unwrap();
         let state = HostState::new(temp.path()).unwrap();
-        state
-            .create_session(executioner_core::CreateSessionRequest {
-                session_id: Some("sess".to_string()),
-                workspace: WorkspaceSpec {
-                    mode: WorkspaceMode::New,
-                    root: None,
-                    snapshot_ref: None,
-                    template_ref: None,
-                    mount_as_workspace: true,
-                },
-                policy: policy(),
-                ttl_ms: None,
-                metadata: serde_json::Map::new(),
-            })
-            .unwrap();
+        create_test_session(&state);
 
         let app = HostServer::new(state).router();
         let body = json!({
@@ -336,7 +420,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_unknown_create_session_fields() {
+    async fn rejects_unknown_create_environment_fields() {
         let temp = TempDir::new().unwrap();
         let app = HostServer::new(HostState::new(temp.path()).unwrap()).router();
         let body = json!({
@@ -352,7 +436,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/sessions")
+                    .uri("/environments")
                     .header("content-type", "application/json")
                     .body(Body::from(serde_json::to_vec(&body).unwrap()))
                     .unwrap(),
@@ -373,7 +457,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/sessions")
+                    .uri("/environments")
                     .header("content-type", "application/json")
                     .body(Body::from("{ definitely not json"))
                     .unwrap(),
@@ -386,13 +470,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_oversized_json_body_before_creating_session() {
+    async fn rejects_oversized_json_body_before_creating_environment() {
         let temp = TempDir::new().unwrap();
         let state = HostState::new(temp.path()).unwrap();
         let app = HostServer::new(state.clone()).router();
         let body = format!(
             r#"{{
-                "sessionId": "sess_huge_body",
+                "environmentId": "env_huge_body",
                 "workspace": {{ "mode": "new", "mountAsWorkspace": true }},
                 "policy": {},
                 "metadata": {{ "padding": "{}" }}
@@ -405,7 +489,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/sessions")
+                    .uri("/environments")
                     .header("content-type", "application/json")
                     .body(Body::from(body))
                     .unwrap(),
@@ -415,29 +499,14 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(error_code(response).await, "invalid_request");
-        assert!(state.get_session("sess_huge_body").is_err());
+        assert!(state.get_environment("env_huge_body").is_err());
     }
 
     #[tokio::test]
     async fn rejects_unknown_invocation_fields_without_running_tool() {
         let temp = TempDir::new().unwrap();
         let state = HostState::new(temp.path()).unwrap();
-        let session = state
-            .create_session(executioner_core::CreateSessionRequest {
-                session_id: Some("sess".to_string()),
-                workspace: WorkspaceSpec {
-                    mode: WorkspaceMode::New,
-                    root: None,
-                    snapshot_ref: None,
-                    template_ref: None,
-                    mount_as_workspace: true,
-                },
-                policy: policy(),
-                ttl_ms: None,
-                metadata: serde_json::Map::new(),
-            })
-            .unwrap()
-            .session;
+        let session = create_test_session(&state);
 
         let app = HostServer::new(state).router();
         let body = json!({
@@ -472,22 +541,7 @@ mod tests {
     async fn exports_workspace_artifact_over_router() {
         let temp = TempDir::new().unwrap();
         let state = HostState::new(temp.path()).unwrap();
-        let session = state
-            .create_session(executioner_core::CreateSessionRequest {
-                session_id: Some("sess".to_string()),
-                workspace: WorkspaceSpec {
-                    mode: WorkspaceMode::New,
-                    root: None,
-                    snapshot_ref: None,
-                    template_ref: None,
-                    mount_as_workspace: true,
-                },
-                policy: policy(),
-                ttl_ms: None,
-                metadata: serde_json::Map::new(),
-            })
-            .unwrap()
-            .session;
+        let session = create_test_session(&state);
         std::fs::write(format!("{}/hello.txt", session.workspace.root), "hello").unwrap();
 
         let app = HostServer::new(state).router();
@@ -495,7 +549,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/sessions/sess/artifacts/workspace")
+                    .uri("/environments/env/artifacts/workspace")
                     .body(Body::empty())
                     .unwrap(),
             )

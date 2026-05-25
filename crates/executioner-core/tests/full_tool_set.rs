@@ -1,6 +1,7 @@
 use executioner_core::{
-    CreateSessionRequest, ExecutionPolicy, HostState, NetworkPolicy, ProcessPolicy, ToolCapability,
-    ToolInvocationRequest, ToolResultStatus, WorkspaceMode, WorkspaceSpec,
+    CreateEnvironmentRequest, CreateSessionRequest, ExecutionPolicy, HostState, NetworkPolicy,
+    ProcessPolicy, ToolCapability, ToolInvocationRequest, ToolResultStatus, WorkspaceMode,
+    WorkspaceSpec,
 };
 use serde_json::{json, Map, Value};
 use std::fs;
@@ -30,8 +31,8 @@ fn session(host: &HostState, allow_exec: bool, allow_network: bool) -> execution
 }
 
 fn session_with_policy(host: &HostState, policy: ExecutionPolicy) -> executioner_core::Session {
-    host.create_session(CreateSessionRequest {
-        session_id: Some("sess".to_string()),
+    host.create_environment(CreateEnvironmentRequest {
+        environment_id: Some("env".to_string()),
         workspace: WorkspaceSpec {
             mode: WorkspaceMode::New,
             root: None,
@@ -43,6 +44,16 @@ fn session_with_policy(host: &HostState, policy: ExecutionPolicy) -> executioner
         ttl_ms: None,
         metadata: Map::new(),
     })
+    .unwrap()
+    .environment;
+    host.create_session(
+        "env",
+        CreateSessionRequest {
+            session_id: Some("sess".to_string()),
+            policy: None,
+            metadata: Map::new(),
+        },
+    )
     .unwrap()
     .session
 }
@@ -836,9 +847,9 @@ fn bash_does_not_use_injected_path_to_resolve_allowed_command_names() {
             .env
             .injected
             .insert("PATH".to_string(), workspace.display().to_string());
-        let session = host
-            .create_session(CreateSessionRequest {
-                session_id: Some("path_env".to_string()),
+        let _environment = host
+            .create_environment(CreateEnvironmentRequest {
+                environment_id: Some("path_env".to_string()),
                 workspace: WorkspaceSpec {
                     mode: WorkspaceMode::Existing,
                     root: Some(workspace.display().to_string()),
@@ -850,6 +861,17 @@ fn bash_does_not_use_injected_path_to_resolve_allowed_command_names() {
                 ttl_ms: None,
                 metadata: Map::new(),
             })
+            .unwrap()
+            .environment;
+        let session = host
+            .create_session(
+                "path_env",
+                CreateSessionRequest {
+                    session_id: Some("path_sess".to_string()),
+                    policy: None,
+                    metadata: Map::new(),
+                },
+            )
             .unwrap()
             .session;
 

@@ -17,8 +17,9 @@ from urllib import error as urlerror
 from urllib import request as urlrequest
 from unittest.mock import patch
 
-from executioner_sdk import Environment, Executioner, ExecutionerEnvironment, tool, tool_schemas
+from executioner_sdk import ExecutionerEnvironment, ExecutionerSession, tool, tool_schemas
 from executioner_sdk.environment import (
+    EnvironmentInfo,
     ResourceRef,
     SessionInfo,
     SubmitResult,
@@ -26,11 +27,12 @@ from executioner_sdk.environment import (
     WorkspaceArtifactEntry,
     WorkspaceInfo,
     _RuntimeConfig,
-    _create_session,
+    _create_environment,
     _ensure_invocation_id_unused,
     _assert_session_id,
     _ensure_file_queue,
     _parse_list_files_result,
+    _parse_create_environment_response,
     _parse_create_session_response,
     _request_json,
     _wait_for_result,
@@ -48,6 +50,9 @@ from executioner_sdk.environment import (
 
 
 def executioner_binary() -> str:
+    debug_binary = Path(__file__).resolve().parents[3] / "target" / "debug" / "executioner"
+    if "EXECUTIONER_BIN" not in os.environ and debug_binary.exists():
+        return str(debug_binary)
     return os.environ.get(
         "EXECUTIONER_BIN",
         str(Path(__file__).resolve().parents[3] / "target" / "release" / "executioner"),
@@ -55,9 +60,6 @@ def executioner_binary() -> str:
 
 
 class ExecutionerEnvironmentTests(unittest.TestCase):
-    def test_environment_alias_points_to_friendly_facade(self) -> None:
-        self.assertIs(Environment, Executioner)
-
     def test_tool_helper_builds_tool_call_envelope(self) -> None:
         self.assertEqual(
             tool("Write", path="notes.txt", content="hello"),
@@ -74,43 +76,6 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
         read_schema = next(schema for schema in schemas if schema["name"] == "Read")
         self.assertEqual(read_schema["input_schema"]["required"], ["path"])
 
-    def test_friendly_executioner_create_lowers_to_environment_config(self) -> None:
-        sentinel = object()
-        with patch.object(ExecutionerEnvironment, "create", return_value=sentinel) as create:
-            env = Executioner.create(
-                workspace=Path("/tmp/substrate-demo"),
-                host="http://127.0.0.1:8765/api",
-                allow_commands=["python", "pytest"],
-                env={"TOKEN": "secret"},
-                lifecycle={"destroyOnClose": False},
-                binary_path="/bin/executioner",
-                submit_timeout_ms=1234,
-                advanced={"worker": {"kind": "external"}},
-            )
-
-        self.assertIs(env, sentinel)
-        create.assert_called_once()
-        kwargs = create.call_args.kwargs
-        self.assertEqual(kwargs["binaryPath"], "/bin/executioner")
-        self.assertEqual(kwargs["host"], {"kind": "http", "baseUrl": "http://127.0.0.1:8765/api"})
-        self.assertEqual(kwargs["worker"], {"kind": "external"})
-        self.assertEqual(
-            kwargs["workspace"],
-            {"kind": "existing", "root": str(Path("/tmp/substrate-demo").resolve())},
-        )
-        self.assertEqual(kwargs["lifecycle"], {"destroyOnClose": False})
-        self.assertEqual(kwargs["submitTimeoutMs"], 1234)
-        self.assertEqual(
-            kwargs["policy"],
-            {
-                "process": {
-                    "allowExec": True,
-                    "allowedCommands": ["python", "pytest"],
-                },
-                "env": {"injected": {"TOKEN": "secret"}},
-            },
-        )
-
     def test_execute_accepts_agent_tool_call_shapes(self) -> None:
         config = _RuntimeConfig(
             binaryPath="executioner",
@@ -125,7 +90,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
             lifecycle={"destroyOnClose": True, "cleanupQueueOnClose": False, "cleanupStateOnClose": False},
             submitTimeoutMs=30_000,
         )
-        session = SessionInfo.from_json({
+        session_info = SessionInfo.from_json({
             "id": "sess",
             "state": "ready",
             "workspace": {
@@ -138,7 +103,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
             "createdAt": "now",
             "metadata": {},
         })
-        env = ExecutionerEnvironment(config, session, [])
+        session = ExecutionerSession(config, session_info)
 
         submitted: list[dict[str, object]] = []
 
@@ -157,8 +122,8 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
                 "metadata": {},
             })
 
-        with patch.object(env, "submit", side_effect=fake_submit):
-            result = env.execute({"id": "call_1", "name": "Read", "input": {"path": "notes.txt"}})
+        with patch.object(session, "submit", side_effect=fake_submit):
+            result = session.execute({"id": "call_1", "name": "Read", "input": {"path": "notes.txt"}})
 
         self.assertEqual(result.output, "ok")
         self.assertEqual(submitted, [{
@@ -831,7 +796,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
                 ),
                 createdAt="now",
             )
-            env = ExecutionerEnvironment(config, session, [])
+            client = ExecutionerSession(config, session)
 
             cases = [
                 (
@@ -926,7 +891,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
 
             for call, error_type, message, invocation_id in cases:
                 with self.assertRaisesRegex(error_type, message):
-                    env.submit(call)  # type: ignore[arg-type]
+                    client.submit(call)  # type: ignore[arg-type]
                 self.assertFalse((queue / "pending" / f"{invocation_id}.json").exists())
 
     @unittest.skipUnless(hasattr(os, "symlink"), "symlinks are not available")
@@ -965,13 +930,13 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
                 ),
                 createdAt="now",
             )
-            env = ExecutionerEnvironment(config, session, [])
+            client = ExecutionerSession(config, session)
             outside_pending.mkdir()
             (queue / "pending").rmdir()
             os.symlink(outside_pending, queue / "pending")
 
             with self.assertRaisesRegex(RuntimeError, "queue state directory"):
-                env.submit({
+                client.submit({
                     "invocationId": "py_swapped_pending",
                     "toolName": "Read",
                     "arguments": {"path": "missing.txt"},
@@ -1065,7 +1030,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
 
         self.assertEqual(runtime.policy["process"]["maxProcesses"], 0)
 
-    def test_create_session_rejects_invalid_returned_session_id(self) -> None:
+    def test_create_environment_rejects_invalid_returned_environment_id(self) -> None:
         runtime = _materialize_config(
             binary_path="executioner",
             backend={"kind": "file"},
@@ -1079,7 +1044,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
 
         def post(_url: str, _body: object) -> dict[str, object]:
             return {
-                "session": {
+                "environment": {
                     "id": "../escaped",
                     "state": "ready",
                     "workspace": {
@@ -1090,12 +1055,14 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
                         "managed": True,
                     },
                     "createdAt": "now",
+                    "revision": 0,
+                    "metadata": {},
                 }
             }
 
         with patch("executioner_sdk.environment._post_json", post):
-            with self.assertRaisesRegex(ValueError, "invalid session id"):
-                _create_session(runtime)
+            with self.assertRaisesRegex(ValueError, "invalid environment id"):
+                _create_environment(runtime)
 
     def test_create_cleans_up_started_resources_on_failure(self) -> None:
         class Managed:
@@ -1139,17 +1106,17 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
             def terminate(managed: Managed) -> None:
                 terminated.append(managed.name)
 
-            def fail_create(_runtime: _RuntimeConfig) -> SessionInfo:
-                raise RuntimeError("session create failed")
+            def fail_create(_runtime: _RuntimeConfig) -> EnvironmentInfo:
+                raise RuntimeError("environment create failed")
 
             with (
                 patch("executioner_sdk.environment._materialize_config", materialize),
                 patch("executioner_sdk.environment._spawn_process", spawn),
                 patch("executioner_sdk.environment._wait_for_health", lambda *_args: None),
-                patch("executioner_sdk.environment._create_session", fail_create),
+                patch("executioner_sdk.environment._create_environment", fail_create),
                 patch("executioner_sdk.environment._terminate_process", terminate),
             ):
-                with self.assertRaisesRegex(RuntimeError, "session create failed"):
+                with self.assertRaisesRegex(RuntimeError, "environment create failed"):
                     ExecutionerEnvironment.create()
 
             self.assertEqual(terminated, ["executioner-host"])
@@ -1187,8 +1154,8 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
                 },
                 submitTimeoutMs=100,
             )
-            session = SessionInfo(
-                id="sess_partial",
+            environment = EnvironmentInfo(
+                id="env_partial",
                 state="ready",
                 workspace=WorkspaceInfo(
                     root="/workspace",
@@ -1198,6 +1165,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
                     managed=True,
                 ),
                 createdAt="now",
+                revision=0,
             )
             events: list[str] = []
 
@@ -1215,27 +1183,26 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
             def destroy(url: str) -> dict[str, object]:
                 events.append(f"destroy:{url.rsplit('/', 1)[-1]}")
                 return {
-                    "session": {
-                        "id": session.id,
-                        "state": "destroyed",
-                        "workspace": session.workspace.__dict__,
-                        "createdAt": session.createdAt,
-                        "metadata": {},
-                    }
+                    "id": environment.id,
+                    "state": "destroyed",
+                    "workspace": environment.workspace.__dict__,
+                    "createdAt": environment.createdAt,
+                    "revision": 1,
+                    "metadata": {},
                 }
 
             with (
                 patch("executioner_sdk.environment._materialize_config", materialize),
                 patch("executioner_sdk.environment._spawn_process", spawn),
                 patch("executioner_sdk.environment._wait_for_health", lambda *_args: None),
-                patch("executioner_sdk.environment._create_session", lambda *_args: session),
+                patch("executioner_sdk.environment._create_environment", lambda *_args: environment),
                 patch("executioner_sdk.environment._terminate_process", terminate),
                 patch("executioner_sdk.environment._delete_json", destroy),
             ):
                 with self.assertRaisesRegex(RuntimeError, "worker start failed"):
                     ExecutionerEnvironment.create()
 
-            self.assertEqual(events, ["destroy:sess_partial", "terminate:executioner-host"])
+            self.assertEqual(events, ["destroy:env_partial", "terminate:executioner-host"])
 
     def test_list_files_parser_prefers_structured_metadata_entries(self) -> None:
         result = SubmitResult.from_json({
@@ -1605,7 +1572,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
     def test_artifact_parser_rejects_malformed_entries_type(self) -> None:
         with self.assertRaisesRegex(TypeError, "artifact entries"):
             WorkspaceArtifact.from_json({
-                "sessionId": "sess",
+                "environmentId": "sess",
                 "artifact": {"resourceType": "artifact", "uri": "file:///tmp/workspace.tar"},
                 "manifest": {"resourceType": "artifact_manifest", "uri": "file:///tmp/workspace.manifest.json"},
                 "format": "tar",
@@ -1621,7 +1588,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
     def test_artifact_parser_rejects_negative_counts(self) -> None:
         with self.assertRaisesRegex(ValueError, "artifact bytes must be non-negative"):
             WorkspaceArtifact.from_json({
-                "sessionId": "sess",
+                "environmentId": "sess",
                 "artifact": {"resourceType": "artifact", "uri": "file:///tmp/workspace.tar"},
                 "manifest": {"resourceType": "artifact_manifest", "uri": "file:///tmp/workspace.manifest.json"},
                 "format": "tar",
@@ -1637,7 +1604,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
     def test_artifact_parser_rejects_missing_required_fields_instead_of_defaulting(self) -> None:
         with self.assertRaisesRegex(ValueError, "artifact hash is required"):
             WorkspaceArtifact.from_json({
-                "sessionId": "sess",
+                "environmentId": "sess",
                 "artifact": {"resourceType": "artifact", "uri": "file:///tmp/workspace.tar"},
                 "manifest": {"resourceType": "artifact_manifest", "uri": "file:///tmp/workspace.manifest.json"},
                 "format": "tar",
@@ -1651,7 +1618,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
 
     def test_artifact_parser_rejects_unknown_fields(self) -> None:
         artifact = {
-            "sessionId": "sess",
+            "environmentId": "sess",
             "artifact": {"resourceType": "artifact", "uri": "file:///tmp/workspace.tar"},
             "manifest": {"resourceType": "artifact_manifest", "uri": "file:///tmp/workspace.manifest.json"},
             "format": "tar",
@@ -2387,6 +2354,8 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
                 "state": "destroyed",
                 "workspace": session.workspace.__dict__,
                 "createdAt": session.createdAt,
+                "revision": 1,
+                "metadata": {},
             }
 
         with (
@@ -2509,6 +2478,8 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
                     "managed": True,
                 },
                 "createdAt": "now",
+                "revision": 1,
+                "metadata": {},
             }):
                 env.close()
 
@@ -2600,6 +2571,8 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
                     "managed": True,
                 },
                 "createdAt": "now",
+                "revision": 1,
+                "metadata": {},
             }):
                 env.close()
 
@@ -2612,27 +2585,28 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
                 workspace={"kind": "existing", "root": workspace},
                 worker={"kind": "managed", "id": "executioner-python-test-worker", "idleSleepMs": 1},
             ) as env:
-                write = env.submit({
+                session = env.create_session()
+                write = session.submit({
                     "toolName": "Write",
                     "arguments": {
                         "path": "hello.txt",
                         "content": "hello from python",
                     },
                 })
-                read = env.submit({
+                read = session.submit({
                     "toolName": "Read",
                     "arguments": {"path": "hello.txt"},
                 })
-                edit = env.edit({
+                edit = session.edit({
                     "path": "hello.txt",
                     "oldString": "hello from python",
                     "newString": "hello from python edit",
                 })
-                edited = env.submit({
+                edited = session.submit({
                     "toolName": "Read",
                     "arguments": {"path": "hello.txt"},
                 })
-                listing = env.list()
+                listing = session.list()
 
             self.assertEqual(write.status, "success")
             self.assertEqual(read.output, "hello from python")
@@ -2648,7 +2622,8 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
                 workspace={"kind": "existing", "root": workspace},
                 worker={"kind": "managed", "id": "executioner-python-artifact-worker", "idleSleepMs": 1},
             ) as env:
-                env.submit({
+                session = env.create_session()
+                session.submit({
                     "toolName": "Write",
                     "arguments": {
                         "path": "artifact.txt",
@@ -2671,7 +2646,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
             _write_gzip_tar_file(tar_path, "file.txt", "payload")
             tar_hash, tar_bytes = _hash_file(tar_path)
             artifact = WorkspaceArtifact(
-                sessionId="sess_test",
+                environmentId="sess_test",
                 artifact=ResourceRef(resourceType="artifact", uri=f"file://{tar_path}"),
                 manifest=ResourceRef(resourceType="artifact_manifest", uri="file:///unused"),
                 format="tar",
@@ -2705,7 +2680,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
             tar_hash, tar_bytes = _hash_file(tar_path)
             destination_parent = root / "new-parent" / "nested"
             artifact = WorkspaceArtifact(
-                sessionId="sess_test",
+                environmentId="sess_test",
                 artifact=ResourceRef(resourceType="artifact", uri=f"file://{tar_path}"),
                 manifest=ResourceRef(resourceType="artifact_manifest", uri="file:///unused"),
                 format="zip",
@@ -2741,7 +2716,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
             tar_path.write_bytes(tar_path.read_bytes()[:-1024])
             tar_hash, tar_bytes = _hash_file(tar_path)
             artifact = WorkspaceArtifact(
-                sessionId="sess_test",
+                environmentId="sess_test",
                 artifact=ResourceRef(resourceType="artifact", uri=f"file://{tar_path}"),
                 manifest=ResourceRef(resourceType="artifact_manifest", uri="file:///unused"),
                 format="tar",
@@ -2775,7 +2750,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
             tar_path.write_bytes(tar_path.read_bytes() + (b"x" * 512))
             tar_hash, tar_bytes = _hash_file(tar_path)
             artifact = WorkspaceArtifact(
-                sessionId="sess_test",
+                environmentId="sess_test",
                 artifact=ResourceRef(resourceType="artifact", uri=f"file://{tar_path}"),
                 manifest=ResourceRef(resourceType="artifact_manifest", uri="file:///unused"),
                 format="tar",
@@ -2813,7 +2788,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
             outside.mkdir()
             os.symlink(outside, link_parent)
             artifact = WorkspaceArtifact(
-                sessionId="sess_test",
+                environmentId="sess_test",
                 artifact=ResourceRef(resourceType="artifact", uri=f"file://{tar_path}"),
                 manifest=ResourceRef(resourceType="artifact_manifest", uri="file:///unused"),
                 format="tar",
@@ -2851,7 +2826,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
             (outside / "existing").mkdir(parents=True)
             os.symlink(outside, link_parent)
             artifact = WorkspaceArtifact(
-                sessionId="sess_test",
+                environmentId="sess_test",
                 artifact=ResourceRef(resourceType="artifact", uri=f"file://{tar_path}"),
                 manifest=ResourceRef(resourceType="artifact_manifest", uri="file:///unused"),
                 format="tar",
@@ -2884,7 +2859,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
             _write_tar_file(tar_path, "safe.txt", "safe")
             tar_hash, tar_bytes = _hash_file(tar_path)
             artifact = WorkspaceArtifact(
-                sessionId="sess_test",
+                environmentId="sess_test",
                 artifact=ResourceRef(resourceType="artifact", uri=f"file://{tar_path}"),
                 manifest=ResourceRef(resourceType="artifact_manifest", uri=f"file://{root / 'manifest.json'}"),
                 format="tar",
@@ -2918,7 +2893,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
             _write_tar_file(tar_path, "one.txt", "x")
             tar_hash, tar_bytes = _hash_file(tar_path)
             artifact = WorkspaceArtifact(
-                sessionId="sess_test",
+                environmentId="sess_test",
                 artifact=ResourceRef(resourceType="artifact", uri=f"file://{tar_path}"),
                 manifest=ResourceRef(resourceType="artifact_manifest", uri="file:///unused"),
                 format="tar",
@@ -2951,7 +2926,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
             _write_tar_file(tar_path, "one.txt", "x")
             tar_hash, tar_bytes = _hash_file(tar_path)
             artifact = WorkspaceArtifact(
-                sessionId="sess_test",
+                environmentId="sess_test",
                 artifact=ResourceRef(resourceType="artifact", uri=f"file://{tar_path}"),
                 manifest=ResourceRef(resourceType="artifact_manifest", uri="file:///unused"),
                 format="tar",
@@ -2987,7 +2962,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
             tar_hash, tar_bytes = _hash_file(tar_path)
             os.symlink(tar_path, link_path)
             artifact = WorkspaceArtifact(
-                sessionId="sess_test",
+                environmentId="sess_test",
                 artifact=ResourceRef(resourceType="artifact", uri=f"file://{link_path}"),
                 manifest=ResourceRef(resourceType="artifact_manifest", uri="file:///unused"),
                 format="tar",
@@ -3023,7 +2998,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
             _write_tar_file(tar_path, "file.txt", "payload")
             tar_hash, tar_bytes = _hash_file(tar_path)
             artifact = WorkspaceArtifact(
-                sessionId="sess_test",
+                environmentId="sess_test",
                 artifact=ResourceRef(resourceType="artifact", uri=f"file://{tar_path}"),
                 manifest=ResourceRef(resourceType="artifact_manifest", uri=f"file://{manifest_link}"),
                 format="tar",
@@ -3045,7 +3020,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
             )
             manifest_path.write_text(
                 json.dumps({
-                    "sessionId": artifact.sessionId,
+                    "environmentId": artifact.environmentId,
                     "artifact": artifact.artifact.__dict__,
                     "manifest": artifact.manifest.__dict__,
                     "format": artifact.format,
@@ -3073,7 +3048,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
             _write_tar_file(tar_path, "partial.txt", "partial")
             tar_hash, tar_bytes = _hash_file(tar_path)
             artifact = WorkspaceArtifact(
-                sessionId="sess_test",
+                environmentId="sess_test",
                 artifact=ResourceRef(resourceType="artifact", uri=f"file://{tar_path}"),
                 manifest=ResourceRef(resourceType="artifact_manifest", uri=f"file://{root / 'manifest.json'}"),
                 format="tar",
@@ -3114,7 +3089,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
             _write_tar_file(tar_path, "dir/file.txt", "payload")
             tar_hash, tar_bytes = _hash_file(tar_path)
             artifact = WorkspaceArtifact(
-                sessionId="sess_test",
+                environmentId="sess_test",
                 artifact=ResourceRef(resourceType="artifact", uri=f"file://{tar_path}"),
                 manifest=ResourceRef(resourceType="artifact_manifest", uri="file:///unused"),
                 format="tar",
@@ -3148,7 +3123,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
             _write_tar_file(tar_path, "file.txt", "payload")
             tar_hash, tar_bytes = _hash_file(tar_path)
             artifact = WorkspaceArtifact(
-                sessionId="sess_test",
+                environmentId="sess_test",
                 artifact=ResourceRef(resourceType="artifact", uri=f"file://{tar_path}"),
                 manifest=ResourceRef(resourceType="artifact_manifest", uri=f"file://{manifest_path}"),
                 format="tar",
@@ -3170,7 +3145,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
             )
             manifest_path.write_text(
                 json.dumps({
-                    "sessionId": artifact.sessionId,
+                    "environmentId": artifact.environmentId,
                     "artifact": artifact.artifact.__dict__,
                     "manifest": artifact.manifest.__dict__,
                     "format": artifact.format,
@@ -3201,7 +3176,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
             _write_tar_file(tar_path, "file.txt", "payload")
             tar_hash, tar_bytes = _hash_file(tar_path)
             artifact = WorkspaceArtifact(
-                sessionId="sess_test",
+                environmentId="sess_test",
                 artifact=ResourceRef(resourceType="artifact", uri=f"file://{tar_path}"),
                 manifest=ResourceRef(resourceType="artifact_manifest", uri=f"file://{manifest_path}"),
                 format="tar",
@@ -3223,7 +3198,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
             )
             manifest_path.write_text(
                 json.dumps({
-                    "sessionId": artifact.sessionId,
+                    "environmentId": artifact.environmentId,
                     "artifact": artifact.artifact.__dict__,
                     "manifest": artifact.manifest.__dict__,
                     "format": artifact.format,
@@ -3250,7 +3225,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
             tar_path = root / "workspace.tar"
             _write_tar_file(tar_path, "file.txt", "payload")
             artifact = WorkspaceArtifact(
-                sessionId="sess_test",
+                environmentId="sess_test",
                 artifact=ResourceRef(resourceType="artifact", uri=f"file://{tar_path}"),
                 manifest=ResourceRef(resourceType="artifact_manifest", uri="file:///unused"),
                 format="tar",
@@ -3283,7 +3258,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
             _write_empty_tar(tar_path)
             tar_hash, tar_bytes = _hash_file(tar_path)
             artifact = WorkspaceArtifact(
-                sessionId="sess_test",
+                environmentId="sess_test",
                 artifact=ResourceRef(resourceType="artifact", uri=f"file://{tar_path}"),
                 manifest=ResourceRef(resourceType="artifact_manifest", uri="file:///unused"),
                 format="tar",
@@ -3317,7 +3292,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
             tar_hash, tar_bytes = _hash_file(tar_path)
             archive_path = "/".join(["d"] * 257)
             artifact = WorkspaceArtifact(
-                sessionId="sess_test",
+                environmentId="sess_test",
                 artifact=ResourceRef(resourceType="artifact", uri=f"file://{tar_path}"),
                 manifest=ResourceRef(resourceType="artifact_manifest", uri="file:///unused"),
                 format="tar",
@@ -3349,7 +3324,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
             with tar_path.open("wb") as file:
                 file.truncate(100 * 1024 * 1024 + 1)
             artifact = WorkspaceArtifact(
-                sessionId="sess_test",
+                environmentId="sess_test",
                 artifact=ResourceRef(resourceType="artifact", uri=f"file://{tar_path}"),
                 manifest=ResourceRef(resourceType="artifact_manifest", uri="file:///unused"),
                 format="tar",
@@ -3374,7 +3349,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
             _write_tar_file(tar_path, "file.txt", "payload")
             tar_hash, tar_bytes = _hash_file(tar_path)
             artifact = WorkspaceArtifact(
-                sessionId="sess_test",
+                environmentId="sess_test",
                 artifact=ResourceRef(resourceType="artifact", uri=f"file://{tar_path}"),
                 manifest=ResourceRef(
                     resourceType="artifact_manifest",
@@ -3410,7 +3385,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
             _write_tar_file(tar_path, "file.txt", "payload")
             tar_hash, tar_bytes = _hash_file(tar_path)
             artifact = WorkspaceArtifact(
-                sessionId="sess_test",
+                environmentId="sess_test",
                 artifact=ResourceRef(resourceType="artifact", uri=f"file://{tar_path}"),
                 manifest=ResourceRef(
                     resourceType="artifact_manifest",
@@ -3446,7 +3421,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
             _write_empty_tar(tar_path)
             tar_hash, tar_bytes = _hash_file(tar_path)
             artifact = WorkspaceArtifact(
-                sessionId="sess_test",
+                environmentId="sess_test",
                 artifact=ResourceRef(resourceType="artifact", uri=f"file://{tar_path}"),
                 manifest=ResourceRef(resourceType="artifact_manifest", uri="file:///unused"),
                 format="tar",
@@ -3477,7 +3452,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
             _write_empty_tar(tar_path)
             tar_hash, tar_bytes = _hash_file(tar_path)
             artifact = WorkspaceArtifact(
-                sessionId="sess_test",
+                environmentId="sess_test",
                 artifact=ResourceRef(resourceType="artifact", uri=f"file://{tar_path}"),
                 manifest=ResourceRef(resourceType="artifact_manifest", uri="file:///unused"),
                 format="tar",
@@ -3509,7 +3484,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
             _write_tar_file_raw_path(tar_path, b"bad-\xff.txt", b"payload")
             tar_hash, tar_bytes = _hash_file(tar_path)
             artifact = WorkspaceArtifact(
-                sessionId="sess_test",
+                environmentId="sess_test",
                 artifact=ResourceRef(resourceType="artifact", uri=f"file://{tar_path}"),
                 manifest=ResourceRef(resourceType="artifact_manifest", uri="file:///unused"),
                 format="tar",
@@ -3542,7 +3517,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
             _write_empty_tar(tar_path)
             tar_hash, tar_bytes = _hash_file(tar_path)
             artifact = WorkspaceArtifact(
-                sessionId="sess_test",
+                environmentId="sess_test",
                 artifact=ResourceRef(resourceType="artifact", uri=f"file://{tar_path}"),
                 manifest=ResourceRef(resourceType="artifact_manifest", uri="file:///unused"),
                 format="tar",
@@ -3574,7 +3549,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
             _write_empty_tar(tar_path)
             tar_hash, tar_bytes = _hash_file(tar_path)
             artifact = WorkspaceArtifact(
-                sessionId="sess_test",
+                environmentId="sess_test",
                 artifact=ResourceRef(resourceType="artifact", uri=f"file://{tar_path}"),
                 manifest=ResourceRef(resourceType="artifact_manifest", uri="file:///unused"),
                 format="tar",
@@ -3606,7 +3581,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
             _write_empty_tar(tar_path)
             tar_hash, tar_bytes = _hash_file(tar_path)
             artifact = WorkspaceArtifact(
-                sessionId="sess_test",
+                environmentId="sess_test",
                 artifact=ResourceRef(resourceType="artifact", uri=f"file://{tar_path}"),
                 manifest=ResourceRef(resourceType="artifact_manifest", uri="file:///unused"),
                 format="tar",
@@ -3647,7 +3622,7 @@ class ExecutionerEnvironmentTests(unittest.TestCase):
                 for index in range(10_001)
             ]
             artifact = WorkspaceArtifact(
-                sessionId="sess_test",
+                environmentId="sess_test",
                 artifact=ResourceRef(resourceType="artifact", uri=f"file://{tar_path}"),
                 manifest=ResourceRef(resourceType="artifact_manifest", uri="file:///unused"),
                 format="tar",

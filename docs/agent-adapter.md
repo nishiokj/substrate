@@ -2,22 +2,25 @@
 
 Substrate should not be shaped around a single agent implementation. Agent apps
 integrate by creating an environment, handing the model Substrate's tool schemas,
-and executing matching tool-use responses through that environment.
+creating one or more sessions attached to that environment, and executing
+matching tool-use responses through a session.
 
 ## SDK Boundary
 
-Agent applications should bind to an environment object and submit work to it.
-The default SDK facade hides the host, worker, and queue lifecycle:
+Agent applications should bind environment lifetime separately from session
+lifetime. The environment owns the workspace and host/worker lifecycle; sessions
+submit work against that live environment:
 
 ```ts
-import { Environment } from "@substrate/sdk";
+import { ExecutionerEnvironment } from "@substrate/sdk";
 
-const env = await Environment.create({
-    workspace: "new",
-    allowCommands: ["python", "pytest"],
+const env = await ExecutionerEnvironment.create({
+    workspace: { kind: "new" },
+    policy: { process: { allowExec: true, allowedCommands: ["python", "pytest"] } },
 });
+const session = await env.createSession();
 
-const result = await env.execute({
+const result = await session.execute({
     name: "Write",
     input: {
         path: "notes.txt",
@@ -27,21 +30,21 @@ const result = await env.execute({
 ```
 
 The SDK intentionally exposes SDK-owned types such as `ToolCall`, `ToolSchema`,
-`SubmitResult`, `SessionInfo`, and `StateEffect`. `ExecutionerEnvironment`
-remains available as an advanced escape hatch for explicit host, worker, and
-backend configuration. Protocol structs remain owned by `executioner-core` and
-are used at transport, persistence, and schema boundaries.
+`SubmitResult`, `EnvironmentInfo`, `SessionInfo`, and `StateEffect`. Protocol
+structs remain owned by `executioner-core` and are used at transport,
+persistence, and schema boundaries.
 
 ## Agent Loop Shape
 
 Agent SDKs usually emit a tool-use object with a tool name and JSON input. If
-the model sees Substrate's tool schemas, the environment can execute that object
+the model sees Substrate's tool schemas, the session can execute that object
 directly:
 
 ```ts
 const client = new Anthropic();
-const env = await Environment.create({ workspace: "new" });
-const tools = env.toolSchemas().map((schema) => ({
+const env = await ExecutionerEnvironment.create({ workspace: { kind: "new" } });
+const session = await env.createSession();
+const tools = toolSchemas().map((schema) => ({
     name: schema.name,
     description: schema.description,
     input_schema: schema.inputSchema,
@@ -56,7 +59,7 @@ const response = await client.messages.create({
 
 for (const block of response.content) {
     if (block.type !== "tool_use") continue;
-    const result = await env.execute(block);
+    const result = await session.execute(block);
     messages.push({
         role: "user",
         content: [{
@@ -69,11 +72,11 @@ for (const block of response.content) {
 ```
 
 If an application wants domain-specific tool names or schemas, it can map those
-calls manually while still using the environment as the execution authority:
+calls manually while still using the session as the execution authority:
 
 ```ts
 if (toolUse.name === "read_project_file") {
-    const result = await env.read(toolUse.input.path);
+    const result = await session.read(toolUse.input.path);
     messages.push({
         role: "user",
         content: [{
@@ -91,9 +94,8 @@ integration code proves one is needed.
 
 ## Advanced Worker Modes
 
-The high-level `Environment.create(...)` path starts a managed local host and
-managed worker by default. Advanced callers can still use
-`ExecutionerEnvironment.create(...)` to choose worker and backend behavior:
+`ExecutionerEnvironment.create(...)` starts a managed local host and managed
+worker by default. Callers can choose worker and backend behavior explicitly:
 
 ```text
 managed worker  -> SDK starts a background pull worker process
@@ -114,7 +116,7 @@ executioner worker run \
 ```
 
 When a Unix socket or another broker is added, it should become another
-`HostConfig` or `BackendConfig` variant without changing `env.execute(...)`.
+`HostConfig` or `BackendConfig` variant without changing `session.execute(...)`.
 
 ## Generic Runtime Boundary
 
@@ -142,12 +144,13 @@ implementation of `InvocationBroker` and `ToolHostClient`.
 
 The integration should be deliberately small:
 
-1. Create or attach an `Environment` when an agent run starts.
-2. Pass `env.tool_schemas()` / `env.toolSchemas()` to the model.
-3. Execute matching tool calls with `env.execute(...)`.
-4. Map the agent cwd to `/workspace` logical paths.
-5. Feed only semantic output and summaries into the model context.
-6. Store effects separately for trace, audit, cache invalidation, and UI state.
+1. Create or attach an environment when an agent run starts.
+2. Create a session attached to that environment for the client or agent run.
+3. Pass `tool_schemas()` / `toolSchemas()` to the model.
+4. Execute matching tool calls with `session.execute(...)`.
+5. Map the agent cwd to `/workspace` logical paths.
+6. Feed only semantic output and summaries into the model context.
+7. Store effects separately for trace, audit, cache invalidation, and UI state.
 
 ## What The Agent Should Not Own
 

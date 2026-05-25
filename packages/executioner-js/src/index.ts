@@ -22,6 +22,7 @@ const MAX_WORKSPACE_ARTIFACT_BYTES = 100 * 1024 * 1024;
 const MAX_OUTPUT_BYTES = 10 * 1024 * 1024;
 const MAX_TOOL_TIMEOUT_MS = 60 * 60 * 1000;
 const MAX_PROCESS_COUNT = 2 ** 32 - 1;
+const ENVIRONMENT_STATES = ['starting', 'ready', 'closing', 'closed', 'destroyed', 'failed'] as const;
 const SESSION_STATES = ['starting', 'ready', 'closing', 'closed', 'destroyed', 'failed'] as const;
 const WORKSPACE_MODES = ['new', 'existing', 'snapshot', 'template'] as const;
 const RUNTIME_PACKAGE_PREFIX = '@substrate/executioner-';
@@ -30,8 +31,6 @@ export type WorkspaceConfig =
   | { kind: 'new' }
   | { kind: 'existing'; root: string };
 
-export type FriendlyWorkspace = 'new' | string | WorkspaceConfig;
-
 export type WorkerConfig =
   | { kind: 'managed'; id?: string; idleSleepMs?: number }
   | { kind: 'external' };
@@ -39,8 +38,6 @@ export type WorkerConfig =
 export type HostConfig =
   | { kind: 'managed'; stateDir?: string; host?: string; port?: number }
   | { kind: 'http'; baseUrl: string };
-
-export type FriendlyHost = 'local' | string | HostConfig;
 
 export type BackendConfig = {
   kind: 'file';
@@ -91,23 +88,6 @@ export type EnvironmentConfig = {
   policy?: PolicyConfig;
   lifecycle?: LifecycleConfig;
   submitTimeoutMs?: number;
-};
-
-export type ExecutionerConfig = {
-  workspace?: FriendlyWorkspace;
-  host?: FriendlyHost;
-  allowCommands?: string[];
-  env?: Record<string, string>;
-  policy?: PolicyConfig;
-  lifecycle?: LifecycleConfig;
-  binaryPath?: string;
-  submitTimeoutMs?: number;
-  advanced?: {
-    backend?: BackendConfig;
-    worker?: WorkerConfig;
-    binaryPath?: string;
-    submitTimeoutMs?: number;
-  };
 };
 
 export type ToolCall = {
@@ -188,6 +168,22 @@ export type SessionInfo = {
   metadata: Record<string, unknown>;
 };
 
+export type EnvironmentInfo = {
+  id: string;
+  state: typeof ENVIRONMENT_STATES[number];
+  workspace: {
+    root: string;
+    logicalRoot: string;
+    mode: typeof WORKSPACE_MODES[number];
+    fresh: boolean;
+    managed: boolean;
+  };
+  createdAt: string;
+  expiresAt?: string | null;
+  revision: number;
+  metadata: Record<string, unknown>;
+};
+
 export type ResourceRef = {
   resourceType: string;
   uri: string;
@@ -203,7 +199,7 @@ export type WorkspaceArtifactEntry = {
 };
 
 export type WorkspaceArtifact = {
-  sessionId: string;
+  environmentId: string;
   artifact: ResourceRef;
   manifest: ResourceRef;
   format: string;
@@ -218,6 +214,10 @@ export type WorkspaceArtifact = {
 
 type CreateSessionResponse = {
   session: SessionInfo;
+};
+
+type CreateEnvironmentResponse = {
+  environment: EnvironmentInfo;
 };
 
 type CompletedEnvelope = {
@@ -382,57 +382,17 @@ export function tool(
   };
 }
 
-export class Executioner {
-  static async create(config: ExecutionerConfig = {}): Promise<ExecutionerEnvironment> {
-    const configObject = jsonObject(config, 'executioner config') as ExecutionerConfig;
-    rejectUnknownFields(configObject, [
-      'workspace',
-      'host',
-      'allowCommands',
-      'env',
-      'policy',
-      'lifecycle',
-      'binaryPath',
-      'submitTimeoutMs',
-      'advanced',
-    ], 'executioner config');
-    const advanced = configObject.advanced === undefined
-      ? {}
-      : jsonObject(configObject.advanced, 'advanced config') as NonNullable<ExecutionerConfig['advanced']>;
-    rejectUnknownFields(advanced, [
-      'backend',
-      'worker',
-      'binaryPath',
-      'submitTimeoutMs',
-    ], 'advanced config');
-
-    return ExecutionerEnvironment.create({
-      binaryPath: configObject.binaryPath ?? advanced.binaryPath,
-      backend: advanced.backend,
-      host: friendlyHost(configObject.host ?? 'local'),
-      worker: advanced.worker,
-      workspace: friendlyWorkspace(configObject.workspace ?? 'new'),
-      policy: friendlyPolicy(configObject.policy, {
-        allowCommands: configObject.allowCommands,
-        env: configObject.env,
-      }),
-      lifecycle: configObject.lifecycle,
-      submitTimeoutMs: configObject.submitTimeoutMs ?? advanced.submitTimeoutMs,
-    });
-  }
-}
-
 export class ExecutionerEnvironment {
   private constructor(
     private readonly config: RequiredRuntimeConfig,
-    private readonly sessionInfo: SessionInfo,
+    private readonly environmentInfo: EnvironmentInfo,
     private readonly processes: ManagedProcess[],
   ) {}
 
   static async create(config: EnvironmentConfig = {}): Promise<ExecutionerEnvironment> {
     const runtime = await materializeConfig(config);
     const processes: ManagedProcess[] = [];
-    let session: SessionInfo | undefined;
+    let environment: EnvironmentInfo | undefined;
 
     try {
       if (runtime.host.kind === 'managed') {
@@ -452,7 +412,7 @@ export class ExecutionerEnvironment {
 
       await ensureFileQueue(runtime.queueDir);
 
-      session = await createSession(runtime);
+      environment = await createEnvironment(runtime);
 
       if (runtime.worker.kind === 'managed') {
         const workerProcess = spawnProcess(runtime.binaryPath, [
@@ -471,12 +431,71 @@ export class ExecutionerEnvironment {
         await waitForManagedProcessStartup(workerProcess);
       }
 
-      return new ExecutionerEnvironment(runtime, session, processes);
+      return new ExecutionerEnvironment(runtime, environment, processes);
     } catch (error) {
-      await cleanupPartialCreate(runtime, processes, session);
+      await cleanupPartialCreate(runtime, processes, environment);
       throw error;
     }
   }
+
+  get environment(): EnvironmentInfo {
+    return this.environmentInfo;
+  }
+
+  async createSession(policy?: PolicyConfig): Promise<ExecutionerSession> {
+    const session = await createSession(this.config, this.environmentInfo.id, policy);
+    return new ExecutionerSession(this.config, session);
+  }
+
+  async exportWorkspace(): Promise<WorkspaceArtifact> {
+    assertEnvironmentId(this.environmentInfo.id);
+    return parseWorkspaceArtifact(await postJson(
+      `${this.config.baseUrl}environments/${this.environmentInfo.id}/artifacts/workspace`,
+      null,
+    ));
+  }
+
+  async materializeWorkspaceArtifact(
+    artifact: WorkspaceArtifact,
+    destination: string,
+  ): Promise<void> {
+    await materializeWorkspaceArtifact(artifact, destination);
+  }
+
+  async close(): Promise<EnvironmentInfo> {
+    assertEnvironmentId(this.environmentInfo.id);
+    const workers = this.processes.filter((managed) => managed.name !== 'executioner-host');
+    const hosts = this.processes.filter((managed) => managed.name === 'executioner-host');
+    for (const managed of [...workers].reverse()) {
+      await terminateProcess(managed);
+    }
+
+    let environment: EnvironmentInfo;
+    try {
+      environment = this.config.lifecycle.destroyOnClose
+        ? parseEnvironmentInfo(await deleteJson(`${this.config.baseUrl}environments/${this.environmentInfo.id}`))
+        : parseEnvironmentInfo(await postJson(`${this.config.baseUrl}environments/${this.environmentInfo.id}/close`, null));
+    } finally {
+      for (const managed of [...hosts].reverse()) {
+        await terminateProcess(managed);
+      }
+      if (this.config.lifecycle.cleanupQueueOnClose) {
+        await cleanupQueueDir(this.config.queueDir, this.config.sdkCreatedQueueDir);
+      }
+      if (this.config.lifecycle.cleanupStateOnClose && this.config.host.kind === 'managed') {
+        await cleanupStateDir(this.config.host.stateDir, this.config.sdkCreatedStateDir);
+      }
+    }
+
+    return environment;
+  }
+}
+
+export class ExecutionerSession {
+  constructor(
+    private readonly config: RequiredRuntimeConfig,
+    private readonly sessionInfo: SessionInfo,
+  ) {}
 
   get session(): SessionInfo {
     return this.sessionInfo;
@@ -593,51 +612,11 @@ export class ExecutionerEnvironment {
     return this.listFiles(options);
   }
 
-  async exportWorkspace(): Promise<WorkspaceArtifact> {
-    assertSessionId(this.sessionInfo.id);
-    return parseWorkspaceArtifact(await postJson(
-      `${this.config.baseUrl}sessions/${this.sessionInfo.id}/artifacts/workspace`,
-      null,
-    ));
-  }
-
-  async materializeWorkspaceArtifact(
-    artifact: WorkspaceArtifact,
-    destination: string,
-  ): Promise<void> {
-    await materializeWorkspaceArtifact(artifact, destination);
-  }
-
   async close(): Promise<SessionInfo> {
     assertSessionId(this.sessionInfo.id);
-    const workers = this.processes.filter((managed) => managed.name !== 'executioner-host');
-    const hosts = this.processes.filter((managed) => managed.name === 'executioner-host');
-    for (const managed of [...workers].reverse()) {
-      await terminateProcess(managed);
-    }
-
-    let session: SessionInfo;
-    try {
-      session = this.config.lifecycle.destroyOnClose
-        ? parseSessionInfo(await deleteJson(`${this.config.baseUrl}sessions/${this.sessionInfo.id}`))
-        : parseSessionInfo(await postJson(`${this.config.baseUrl}sessions/${this.sessionInfo.id}/close`, null));
-    } finally {
-      for (const managed of [...hosts].reverse()) {
-        await terminateProcess(managed);
-      }
-      if (this.config.lifecycle.cleanupQueueOnClose) {
-        await cleanupQueueDir(this.config.queueDir, this.config.sdkCreatedQueueDir);
-      }
-      if (this.config.lifecycle.cleanupStateOnClose && this.config.host.kind === 'managed') {
-        await cleanupStateDir(this.config.host.stateDir, this.config.sdkCreatedStateDir);
-      }
-    }
-
-    return session;
+    return parseSessionInfo(await postJson(`${this.config.baseUrl}sessions/${this.sessionInfo.id}/close`, null));
   }
 }
-
-export const Environment = Executioner;
 
 export async function materializeWorkspaceArtifact(
   artifact: WorkspaceArtifact,
@@ -675,7 +654,7 @@ export async function materializeWorkspaceArtifact(
 async function cleanupPartialCreate(
   runtime: RequiredRuntimeConfig,
   processes: ManagedProcess[],
-  session?: SessionInfo,
+  environment?: EnvironmentInfo,
 ): Promise<void> {
   const workers = processes.filter((managed) => managed.name !== 'executioner-host');
   const hosts = processes.filter((managed) => managed.name === 'executioner-host');
@@ -683,12 +662,12 @@ async function cleanupPartialCreate(
     await terminateProcess(managed);
   }
   try {
-    if (session && /^[A-Za-z0-9_-]{1,128}$/.test(session.id)) {
+    if (environment && /^[A-Za-z0-9_-]{1,128}$/.test(environment.id)) {
       try {
         if (runtime.lifecycle.destroyOnClose) {
-          await deleteJson(`${runtime.baseUrl}sessions/${session.id}`);
+          await deleteJson(`${runtime.baseUrl}environments/${environment.id}`);
         } else {
-          await postJson(`${runtime.baseUrl}sessions/${session.id}/close`, null);
+          await postJson(`${runtime.baseUrl}environments/${environment.id}/close`, null);
         }
       } catch {
         // Best effort cleanup during failed construction.
@@ -730,71 +709,6 @@ type RequiredPolicyConfig = {
   maxDurationMs: number;
   maxOutputBytes: number;
 };
-
-function friendlyWorkspace(workspace: FriendlyWorkspace): WorkspaceConfig {
-  if (typeof workspace === 'object') {
-    return workspace;
-  }
-  if (workspace === 'new') {
-    return { kind: 'new' };
-  }
-  return {
-    kind: 'existing',
-    root: resolve(workspace),
-  };
-}
-
-function friendlyHost(host: FriendlyHost): HostConfig {
-  if (typeof host === 'object') {
-    return host;
-  }
-  if (host === 'local') {
-    return { kind: 'managed' };
-  }
-  if (host.startsWith('http://') || host.startsWith('https://')) {
-    return { kind: 'http', baseUrl: host };
-  }
-  throw new Error("host must be 'local', an HTTP(S) URL, or a host config object");
-}
-
-function friendlyPolicy(
-  policy: PolicyConfig | undefined,
-  options: { allowCommands?: string[]; env?: Record<string, string> },
-): PolicyConfig | undefined {
-  if (policy === undefined && options.allowCommands === undefined && options.env === undefined) {
-    return undefined;
-  }
-
-  const resolved: PolicyConfig = {
-    ...policy,
-    process: policy?.process === undefined ? undefined : { ...policy.process },
-    network: policy?.network === undefined ? undefined : { ...policy.network },
-    env: policy?.env === undefined ? undefined : {
-      ...policy.env,
-      injected: policy.env.injected === undefined ? undefined : { ...policy.env.injected },
-    },
-  };
-
-  if (options.allowCommands !== undefined) {
-    resolved.process = {
-      ...resolved.process,
-      allowExec: true,
-      allowedCommands: [...options.allowCommands],
-    };
-  }
-
-  if (options.env !== undefined) {
-    resolved.env = {
-      ...resolved.env,
-      injected: {
-        ...resolved.env?.injected,
-        ...options.env,
-      },
-    };
-  }
-
-  return resolved;
-}
 
 function normalizeAgentToolCall(toolCall: AgentToolCall): ToolCall {
   const call = jsonObject(toolCall, 'agent tool call') as AgentToolCall;
@@ -992,7 +906,7 @@ function validatePolicyRoots(roots: string[], label: string): void {
   }
 }
 
-async function createSession(config: RequiredRuntimeConfig): Promise<SessionInfo> {
+async function createEnvironment(config: RequiredRuntimeConfig): Promise<EnvironmentInfo> {
   const workspace = config.workspace.kind === 'existing'
     ? {
         mode: 'existing',
@@ -1004,9 +918,23 @@ async function createSession(config: RequiredRuntimeConfig): Promise<SessionInfo
         mountAsWorkspace: true,
       };
 
-  const response = parseCreateSessionResponse(await postJson(`${config.baseUrl}sessions`, {
+  const response = parseCreateEnvironmentResponse(await postJson(`${config.baseUrl}environments`, {
     workspace,
     policy: config.policy,
+    metadata: {},
+  }));
+  assertEnvironmentId(response.environment.id);
+  return response.environment;
+}
+
+async function createSession(
+  config: RequiredRuntimeConfig,
+  environmentId: string,
+  policy?: PolicyConfig,
+): Promise<SessionInfo> {
+  assertEnvironmentId(environmentId);
+  const response = parseCreateSessionResponse(await postJson(`${config.baseUrl}environments/${environmentId}/sessions`, {
+    policy: policy === undefined ? undefined : materializePolicy(policy),
     metadata: {},
   }));
   assertSessionId(response.session.id);
@@ -1257,6 +1185,12 @@ function assertInvocationId(invocationId: string): void {
 function assertSessionId(sessionId: string): void {
   if (!isSafeIdentifier(sessionId)) {
     throw new Error("Invalid session id: only ASCII letters, numbers, '-' and '_' are allowed");
+  }
+}
+
+function assertEnvironmentId(environmentId: string): void {
+  if (!isSafeIdentifier(environmentId)) {
+    throw new Error("Invalid environment id: only ASCII letters, numbers, '-' and '_' are allowed");
   }
 }
 
@@ -1914,6 +1848,42 @@ function parseCreateSessionResponse(value: unknown): CreateSessionResponse {
   return { session: parseSessionInfo(requiredField(object, 'session', 'session')) };
 }
 
+function parseCreateEnvironmentResponse(value: unknown): CreateEnvironmentResponse {
+  const object = jsonObject(value, 'create environment response');
+  rejectUnknownFields(object, ['environment'], 'create environment response');
+  return { environment: parseEnvironmentInfo(requiredField(object, 'environment', 'environment')) };
+}
+
+function parseEnvironmentInfo(value: unknown): EnvironmentInfo {
+  const object = jsonObject(value, 'environment');
+  rejectUnknownFields(object, [
+    'id',
+    'state',
+    'workspace',
+    'policy',
+    'createdAt',
+    'expiresAt',
+    'metadata',
+    'revision',
+  ], 'environment');
+  if (object.policy != null) {
+    jsonObject(object.policy, 'environment policy');
+  }
+  const state = jsonString(requiredField(object, 'state', 'environment state'), 'environment state');
+  if (!ENVIRONMENT_STATES.includes(state as typeof ENVIRONMENT_STATES[number])) {
+    throw new Error(`unknown environment state: ${state}`);
+  }
+  return {
+    id: jsonString(requiredField(object, 'id', 'environment id'), 'environment id'),
+    state: state as typeof ENVIRONMENT_STATES[number],
+    workspace: parseWorkspaceInfo(requiredField(object, 'workspace', 'environment workspace'), 'environment workspace'),
+    createdAt: jsonString(requiredField(object, 'createdAt', 'environment createdAt'), 'environment createdAt'),
+    expiresAt: jsonOptionalString(object.expiresAt, 'environment expiresAt'),
+    revision: jsonNonNegativeInteger(requiredField(object, 'revision', 'environment revision'), 'environment revision'),
+    metadata: jsonObject(object.metadata ?? {}, 'environment metadata'),
+  };
+}
+
 function parseSessionInfo(value: unknown): SessionInfo {
   const object = jsonObject(value, 'session');
   rejectUnknownFields(object, [
@@ -1932,31 +1902,36 @@ function parseSessionInfo(value: unknown): SessionInfo {
   if (!SESSION_STATES.includes(state as typeof SESSION_STATES[number])) {
     throw new Error(`unknown session state: ${state}`);
   }
-  const workspace = jsonObject(requiredField(object, 'workspace', 'session workspace'), 'session workspace');
+  const workspace = parseWorkspaceInfo(requiredField(object, 'workspace', 'session workspace'), 'session workspace');
+  return {
+    id: jsonString(requiredField(object, 'id', 'session id'), 'session id'),
+    state: state as typeof SESSION_STATES[number],
+    workspace,
+    createdAt: jsonString(requiredField(object, 'createdAt', 'session createdAt'), 'session createdAt'),
+    expiresAt: jsonOptionalString(object.expiresAt, 'session expiresAt'),
+    metadata: jsonObject(object.metadata ?? {}, 'session metadata'),
+  };
+}
+
+function parseWorkspaceInfo(value: unknown, label: string): SessionInfo['workspace'] {
+  const workspace = jsonObject(value, label);
   rejectUnknownFields(workspace, [
     'root',
     'logicalRoot',
     'mode',
     'fresh',
     'managed',
-  ], 'session workspace');
+  ], label);
   const mode = jsonString(requiredField(workspace, 'mode', 'workspace mode'), 'workspace mode');
   if (!WORKSPACE_MODES.includes(mode as typeof WORKSPACE_MODES[number])) {
     throw new Error(`unknown workspace mode: ${mode}`);
   }
   return {
-    id: jsonString(requiredField(object, 'id', 'session id'), 'session id'),
-    state: state as typeof SESSION_STATES[number],
-    workspace: {
-      root: jsonString(requiredField(workspace, 'root', 'workspace root'), 'workspace root'),
-      logicalRoot: jsonString(requiredField(workspace, 'logicalRoot', 'workspace logicalRoot'), 'workspace logicalRoot'),
-      mode: mode as typeof WORKSPACE_MODES[number],
-      fresh: jsonBoolean(requiredField(workspace, 'fresh', 'workspace fresh'), 'workspace fresh'),
-      managed: jsonBoolean(requiredField(workspace, 'managed', 'workspace managed'), 'workspace managed'),
-    },
-    createdAt: jsonString(requiredField(object, 'createdAt', 'session createdAt'), 'session createdAt'),
-    expiresAt: jsonOptionalString(object.expiresAt, 'session expiresAt'),
-    metadata: jsonObject(object.metadata ?? {}, 'session metadata'),
+    root: jsonString(requiredField(workspace, 'root', 'workspace root'), 'workspace root'),
+    logicalRoot: jsonString(requiredField(workspace, 'logicalRoot', 'workspace logicalRoot'), 'workspace logicalRoot'),
+    mode: mode as typeof WORKSPACE_MODES[number],
+    fresh: jsonBoolean(requiredField(workspace, 'fresh', 'workspace fresh'), 'workspace fresh'),
+    managed: jsonBoolean(requiredField(workspace, 'managed', 'workspace managed'), 'workspace managed'),
   };
 }
 
@@ -2078,7 +2053,7 @@ function parseWorkspaceArtifact(value: unknown): WorkspaceArtifact {
   rejectUnknownFields(
     object,
     [
-      'sessionId',
+      'environmentId',
       'artifact',
       'manifest',
       'format',
@@ -2097,7 +2072,7 @@ function parseWorkspaceArtifact(value: unknown): WorkspaceArtifact {
     throw new Error(`workspace artifact exceeds maximum size of ${MAX_WORKSPACE_ARTIFACT_BYTES} bytes`);
   }
   return {
-    sessionId: jsonString(requiredField(object, 'sessionId', 'artifact sessionId'), 'artifact sessionId'),
+    environmentId: jsonString(requiredField(object, 'environmentId', 'artifact environmentId'), 'artifact environmentId'),
     artifact: parseResourceRef(requiredField(object, 'artifact', 'artifact resource'), 'artifact resource'),
     manifest: parseResourceRef(requiredField(object, 'manifest', 'artifact manifest'), 'artifact manifest'),
     format: jsonString(requiredField(object, 'format', 'artifact format'), 'artifact format'),

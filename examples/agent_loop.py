@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 
 from anthropic import Anthropic
-from substrate import Environment
+from substrate import ExecutionerEnvironment, tool_schemas
 
 
 client = Anthropic()
@@ -13,11 +13,15 @@ messages = [{
     "content": "Create notes.txt with a short hello, then read it back.",
 }]
 
-with Environment.create(workspace="new", allow_commands=["python", "pytest"]) as env:
+with ExecutionerEnvironment.create(
+    workspace={"kind": "new"},
+    policy={"process": {"allowExec": True, "allowedCommands": ["python", "pytest"]}},
+) as env:
+    session = env.create_session()
     response = client.messages.create(
         model=model,
         max_tokens=1024,
-        tools=env.tool_schemas(),
+        tools=tool_schemas(),
         messages=messages,
     )
 
@@ -28,7 +32,7 @@ with Environment.create(workspace="new", allow_commands=["python", "pytest"]) as
         if block.type != "tool_use":
             continue
 
-        result = env.execute({
+        result = session.execute({
             "id": block.id,
             "name": block.name,
             "input": block.input,
@@ -44,7 +48,7 @@ with Environment.create(workspace="new", allow_commands=["python", "pytest"]) as
         final = client.messages.create(
             model=model,
             max_tokens=1024,
-            tools=env.tool_schemas(),
+            tools=tool_schemas(),
             messages=messages,
         )
         print(final.content[0].text)

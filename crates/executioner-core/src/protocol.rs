@@ -9,7 +9,7 @@ pub const EVENT_SCHEMA_VERSION: u16 = 1;
 pub const MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024;
 pub const MAX_REQUEST_JSON_BYTES: usize = 1024 * 1024;
 pub const MAX_TOOL_TIMEOUT_MS: u64 = 60 * 60 * 1000;
-pub const MAX_SESSION_TTL_MS: u64 = 365 * 24 * 60 * 60 * 1000;
+pub const MAX_ENVIRONMENT_TTL_MS: u64 = 365 * 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -85,6 +85,9 @@ pub enum ExecutionerEvent {
     ToolInvocationClaimed(ToolInvocationClaimed),
     ToolInvocationCompleted(ToolInvocationCompleted),
     ToolInvocationFailed(ToolInvocationFailed),
+    EnvironmentCreated(CreateEnvironmentResponse),
+    EnvironmentClosed(Environment),
+    EnvironmentDestroyed(Environment),
     SessionCreated(CreateSessionResponse),
     SessionClosed(Session),
     SessionDestroyed(Session),
@@ -103,6 +106,17 @@ pub enum WorkspaceMode {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionState {
+    Starting,
+    Ready,
+    Closing,
+    Closed,
+    Destroyed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvironmentState {
     Starting,
     Ready,
     Closing,
@@ -201,6 +215,17 @@ impl Default for ExecutionPolicy {
 pub struct CreateSessionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<ExecutionPolicy>,
+    #[serde(default)]
+    pub metadata: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateEnvironmentRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment_id: Option<String>,
     pub workspace: WorkspaceSpec,
     #[serde(default)]
     pub policy: ExecutionPolicy,
@@ -212,12 +237,33 @@ pub struct CreateSessionRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateEnvironmentResponse {
+    pub environment: Environment,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkspaceBinding {
     pub root: String,
     pub logical_root: String,
     pub mode: WorkspaceMode,
     pub fresh: bool,
     pub managed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Environment {
+    pub id: String,
+    pub state: EnvironmentState,
+    pub workspace: WorkspaceBinding,
+    pub policy: ExecutionPolicy,
+    #[serde(default)]
+    pub metadata: Map<String, Value>,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    pub revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -243,7 +289,7 @@ pub struct CreateSessionResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkspaceArtifact {
-    pub session_id: String,
+    pub environment_id: String,
     pub artifact: ResourceRef,
     pub manifest: ResourceRef,
     pub format: String,

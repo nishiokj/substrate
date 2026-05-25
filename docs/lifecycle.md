@@ -1,8 +1,31 @@
-# Session Lifecycle
+# Environment And Session Lifecycle
 
-Sessions are the state boundary. Each invocation belongs to exactly one session.
-The current implementation supports `new` and `existing` workspaces; `snapshot`
-and `template` remain protocol states until the snapshot store exists.
+Environments are the resource boundary: they own the workspace, policy ceiling,
+TTL, artifacts, and revision. Sessions are participation boundaries: each
+session attaches an actor or client workflow to one environment and each
+invocation belongs to exactly one session. The current implementation supports
+`new` and `existing` environment workspaces; `snapshot` and `template` remain
+protocol states until the snapshot store exists.
+
+Closing a session prevents new work through that participation context, but it
+does not destroy the environment. Destroying an environment removes all attached
+sessions and deletes the managed workspace. New sessions are always created
+inside an existing environment; there is no session-create shortcut that
+implicitly creates or owns an environment.
+
+```mermaid
+stateDiagram-v2
+    [*] --> starting
+    starting --> ready
+    starting --> failed
+    ready --> closing
+    ready --> failed
+    closing --> closed
+    closed --> destroyed
+    failed --> destroyed
+```
+
+## Session Lifecycle
 
 ```mermaid
 stateDiagram-v2
@@ -20,11 +43,11 @@ stateDiagram-v2
 
 `new`
 
-Create an empty workspace for this session.
+Create an empty workspace for this environment.
 
 `existing`
 
-Bind an existing host directory as the session workspace.
+Bind an existing host directory as the environment workspace.
 
 `snapshot`
 
@@ -45,9 +68,9 @@ The host should expose a stable logical root:
 The real host path may be different:
 
 ```text
-/tmp/executioner/sessions/sess_123/workspace
+/tmp/executioner/environments/env_123/workspace
 /Users/example/project
-/var/lib/executioner/workspaces/sess_123
+/var/lib/executioner/workspaces/env_123
 ```
 
 Tools and agent-visible results should prefer logical paths. Host internals can
@@ -116,66 +139,74 @@ current implementation would execute duplicate side effects.
 ## Host API
 
 ```text
-POST   /sessions
+POST   /environments
+GET    /environments/:environmentId
+POST   /environments/:environmentId/close
+DELETE /environments/:environmentId
+POST   /environments/:environmentId/sessions
+GET    /environments/:environmentId/effects
+POST   /environments/:environmentId/artifacts/workspace
+
 GET    /sessions/:sessionId
 POST   /sessions/:sessionId/close
 DELETE /sessions/:sessionId
 
 POST   /sessions/:sessionId/invocations
 GET    /sessions/:sessionId/invocations/:invocationId
-GET    /sessions/:sessionId/effects
-POST   /sessions/:sessionId/artifacts/workspace
 ```
 
-The HTTP server currently stores sessions in process memory and writes managed
-workspaces under the host state directory. Destroying a managed session removes
-its workspace. Managed `new` workspaces must canonicalize under the host state
-directory; preexisting symlinked session or workspace paths are rejected before
-creation so stale state cannot redirect a managed workspace outside host-owned
-storage. Existing workspaces are never deleted by destroy. SDK and worker HTTP
-clients cap successful JSON response bodies at 10 MiB and error response bodies
-at 64 KiB before including them in errors, so remote host responses cannot
-become unbounded SDK payloads or diagnostics.
+The HTTP server currently stores environments and sessions in process memory and
+writes managed workspaces under the host state directory. Destroying a managed
+environment removes its workspace. Managed `new` workspaces must canonicalize
+under the host state directory; preexisting symlinked environment/session or
+workspace paths are rejected before creation so stale state cannot redirect a
+managed workspace outside host-owned storage. Existing workspaces are never
+deleted by destroy. SDK and worker HTTP clients cap successful JSON response
+bodies at 10 MiB and error response bodies at 64 KiB before including them in
+errors, so remote host responses cannot become unbounded SDK payloads or
+diagnostics.
 
 The SDK makes this explicit with lifecycle config:
 
 ```text
-CloseBehavior::DestroySession  -> mark session destroyed; remove managed workspace
-CloseBehavior::CloseSession    -> mark session closed; preserve managed workspace
+CloseBehavior::DestroyEnvironment  -> mark environment destroyed; remove managed workspace
+CloseBehavior::CloseEnvironment    -> mark environment closed; preserve managed workspace
 
 QueueCleanup::Preserve         -> leave file broker directories for audit/debug
 QueueCleanup::DeleteOnClose    -> remove the SDK-owned queue directory on close
 ```
 
-SDK close first stops managed workers, then closes or destroys the session, and
-only then applies queue or state-directory cleanup. That order avoids a managed
-worker processing queued work against a session that is already being destroyed.
+SDK close first stops managed workers, then closes or destroys the environment,
+and only then applies queue or state-directory cleanup. That order avoids a
+managed worker processing queued work against an environment that is already
+being destroyed.
 
 Workspace cleanup and queue cleanup are separate. A managed `new` workspace is
-owned by the host session lifecycle. A file-backed broker queue is owned by the
+owned by the host environment lifecycle. A file-backed broker queue is owned by the
 SDK/backend lifecycle. An `existing` workspace is caller-owned and is preserved
-even when the session is destroyed. JS and Python SDKs only delete managed host
+even when the environment is destroyed. JS and Python SDKs only delete managed host
 state directories by default when they created the temporary state directory;
 caller-provided `stateDir` values are preserved unless cleanup is explicitly
 enabled.
 
-If a session is created with `ttlMs`, the host treats it as expired after that
-duration. Expired managed sessions are purged on the next host operation and
-their managed workspace is removed. Existing workspaces are not removed by TTL
-purge, for the same reason they are not removed by explicit destroy.
+If an environment is created with `ttlMs`, the host treats it as expired after
+that duration. Expired managed environments are purged on the next host
+operation and their managed workspace is removed. Existing workspaces are not
+removed by TTL purge, for the same reason they are not removed by explicit
+destroy.
 TTL values above one year, or values that cannot be represented by the host
 clock, are rejected before any managed workspace is created.
 
 ## Workspace Artifacts
 
-A workspace can be exported while the session exists:
+A workspace can be exported while the environment exists:
 
 ```text
-POST /sessions/:sessionId/artifacts/workspace
+POST /environments/:environmentId/artifacts/workspace
 ```
 
 The host writes a deterministic tar archive and a JSON manifest under the host
-state directory for that session. The response includes file URIs for both
+state directory for that environment. The response includes file URIs for both
 files, archive size, archive hash, counts, and per-entry hashes for regular
 files. Exports are capped at 10,000 workspace entries before tar or manifest
 files are finalized. Workspace paths that would require backslash separators are

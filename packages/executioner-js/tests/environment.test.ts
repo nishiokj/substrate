@@ -7,9 +7,8 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import {
-  Executioner,
   ExecutionerEnvironment,
-  Environment,
+  ExecutionerSession,
   materializeWorkspaceArtifact,
   tool,
   toolSchemas,
@@ -24,15 +23,25 @@ import {
 const cleanup: string[] = [];
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const repoRoot = resolve(packageRoot, '../..');
-const repoExecutionerBinary = join(
+const repoDebugExecutionerBinary = join(
+  repoRoot,
+  'target',
+  'debug',
+  process.platform === 'win32' ? 'executioner.exe' : 'executioner',
+);
+const repoReleaseExecutionerBinary = join(
   repoRoot,
   'target',
   'release',
   process.platform === 'win32' ? 'executioner.exe' : 'executioner',
 );
 
-if (!process.env.EXECUTIONER_BIN && existsSync(repoExecutionerBinary)) {
-  process.env.EXECUTIONER_BIN = repoExecutionerBinary;
+if (!process.env.EXECUTIONER_BIN) {
+  if (existsSync(repoDebugExecutionerBinary)) {
+    process.env.EXECUTIONER_BIN = repoDebugExecutionerBinary;
+  } else if (existsSync(repoReleaseExecutionerBinary)) {
+    process.env.EXECUTIONER_BIN = repoReleaseExecutionerBinary;
+  }
 }
 
 afterEach(async () => {
@@ -51,15 +60,15 @@ function runtimeSidecarPackageName(): string | undefined {
   return `@substrate/executioner-${process.platform}-${process.arch}`;
 }
 
-function runtimeResolutionServer(sessionId: string): ReturnType<typeof Bun.serve> {
+function runtimeResolutionServer(environmentId: string): ReturnType<typeof Bun.serve> {
   return Bun.serve({
     port: 0,
     async fetch(request) {
       const url = new URL(request.url);
-      if (request.method === 'POST' && url.pathname === '/sessions') {
+      if (request.method === 'POST' && url.pathname === '/environments') {
         return Response.json({
-          session: {
-            id: sessionId,
+          environment: {
+            id: environmentId,
             state: 'ready',
             workspace: {
               root: '/tmp/workspace',
@@ -69,13 +78,14 @@ function runtimeResolutionServer(sessionId: string): ReturnType<typeof Bun.serve
               managed: true,
             },
             createdAt: 'now',
+            revision: 0,
             metadata: {},
           },
         });
       }
-      if (request.method === 'DELETE' && url.pathname === `/sessions/${sessionId}`) {
+      if (request.method === 'DELETE' && url.pathname === `/environments/${environmentId}`) {
         return Response.json({
-          id: sessionId,
+          id: environmentId,
           state: 'destroyed',
           workspace: {
             root: '/tmp/workspace',
@@ -85,6 +95,7 @@ function runtimeResolutionServer(sessionId: string): ReturnType<typeof Bun.serve
             managed: true,
           },
           createdAt: 'now',
+          revision: 0,
           metadata: {},
         });
       }
@@ -94,10 +105,6 @@ function runtimeResolutionServer(sessionId: string): ReturnType<typeof Bun.serve
 }
 
 describe('ExecutionerEnvironment file queue validation', () => {
-  test('Environment alias points to friendly facade', () => {
-    expect(Environment).toBe(Executioner);
-  });
-
   test('tool helper builds tool call envelope', () => {
     expect(tool('Write', { path: 'notes.txt', content: 'hello' })).toEqual({
       toolName: 'Write',
@@ -114,54 +121,11 @@ describe('ExecutionerEnvironment file queue validation', () => {
     });
   });
 
-  test('friendly Executioner.create lowers to environment config', async () => {
-    const originalCreate = ExecutionerEnvironment.create;
-    const calls: unknown[] = [];
-    const sentinel = {};
-    (ExecutionerEnvironment as unknown as { create: (config: unknown) => Promise<unknown> }).create = async (config: unknown) => {
-      calls.push(config);
-      return sentinel;
-    };
-    try {
-      const env = await Executioner.create({
-        workspace: '/tmp/substrate-demo',
-        host: 'http://127.0.0.1:8765/api',
-        allowCommands: ['python', 'pytest'],
-        env: { TOKEN: 'secret' },
-        lifecycle: { destroyOnClose: false },
-        binaryPath: '/bin/executioner',
-        submitTimeoutMs: 1234,
-        advanced: { worker: { kind: 'external' } },
-      });
-
-      expect(env).toBe(sentinel as ExecutionerEnvironment);
-      expect(calls).toEqual([{
-        binaryPath: '/bin/executioner',
-        backend: undefined,
-        host: { kind: 'http', baseUrl: 'http://127.0.0.1:8765/api' },
-        worker: { kind: 'external' },
-        workspace: { kind: 'existing', root: '/tmp/substrate-demo' },
-        policy: {
-          process: {
-            allowExec: true,
-            allowedCommands: ['python', 'pytest'],
-          },
-          env: { injected: { TOKEN: 'secret' } },
-        },
-        lifecycle: { destroyOnClose: false },
-        submitTimeoutMs: 1234,
-      }]);
-    } finally {
-      (ExecutionerEnvironment as unknown as { create: typeof originalCreate }).create = originalCreate;
-    }
-  });
-
   test('execute accepts agent tool call shapes', async () => {
-    const env = new (ExecutionerEnvironment as unknown as new (
+    const session = new (ExecutionerSession as unknown as new (
       config: unknown,
       session: unknown,
-      processes: unknown[],
-    ) => ExecutionerEnvironment)(
+    ) => ExecutionerSession)(
       {
         queueDir: '/tmp/queue',
         submitTimeoutMs: 30_000,
@@ -169,11 +133,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
       {
         id: 'sess',
       },
-      [],
     );
     const calls: unknown[] = [];
-    const originalSubmit = env.submit;
-    env.submit = async (call: ToolCall) => {
+    const originalSubmit = session.submit;
+    session.submit = async (call: ToolCall) => {
       calls.push(call);
       return {
         invocationId: 'inv',
@@ -187,7 +150,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
       };
     };
     try {
-      const result = await env.execute({
+      const result = await session.execute({
         id: 'call_1',
         name: 'Read',
         input: { path: 'notes.txt' },
@@ -199,7 +162,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
         metadata: { toolCallId: 'call_1' },
       }]);
     } finally {
-      env.submit = originalSubmit;
+      session.submit = originalSubmit;
     }
   });
 
@@ -451,10 +414,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
       port: 0,
       async fetch(request) {
         const url = new URL(request.url);
-        if (request.method === 'POST' && url.pathname === '/sessions') {
+        if (request.method === 'POST' && url.pathname === '/environments') {
           body = await request.json() as Record<string, unknown>;
           return Response.json({
-            session: {
+            environment: {
               id: 'sess_max_processes',
               state: 'ready',
               workspace: {
@@ -465,10 +428,12 @@ describe('ExecutionerEnvironment file queue validation', () => {
                 managed: true,
               },
               createdAt: 'now',
+              revision: 0,
+              metadata: {},
             },
           });
         }
-        if (request.method === 'DELETE' && url.pathname === '/sessions/sess_max_processes') {
+        if (request.method === 'DELETE' && url.pathname === '/environments/sess_max_processes') {
           return Response.json({
             id: 'sess_max_processes',
             state: 'destroyed',
@@ -480,6 +445,8 @@ describe('ExecutionerEnvironment file queue validation', () => {
               managed: true,
             },
             createdAt: 'now',
+            revision: 0,
+            metadata: {},
           });
         }
         return new Response('not found', { status: 404 });
@@ -510,9 +477,9 @@ describe('ExecutionerEnvironment file queue validation', () => {
       port: 0,
       async fetch(request) {
         const url = new URL(request.url);
-        if (request.method === 'POST' && url.pathname === '/sessions') {
+        if (request.method === 'POST' && url.pathname === '/environments') {
           return Response.json({
-            session: {
+            environment: {
               id: 'sess_runtime_resolution',
               state: 'ready',
               workspace: {
@@ -523,11 +490,12 @@ describe('ExecutionerEnvironment file queue validation', () => {
                 managed: true,
               },
               createdAt: 'now',
+              revision: 0,
               metadata: {},
             },
           });
         }
-        if (request.method === 'DELETE' && url.pathname === '/sessions/sess_runtime_resolution') {
+        if (request.method === 'DELETE' && url.pathname === '/environments/sess_runtime_resolution') {
           return Response.json({
             id: 'sess_runtime_resolution',
             state: 'destroyed',
@@ -539,6 +507,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
               managed: true,
             },
             createdAt: 'now',
+            revision: 0,
             metadata: {},
           });
         }
@@ -659,11 +628,12 @@ describe('ExecutionerEnvironment file queue validation', () => {
       host: { kind: 'managed', stateDir },
       worker: { kind: 'external' },
       lifecycle: { cleanupQueueOnClose: false, cleanupStateOnClose: false },
-      submitTimeoutMs: 100,
+      submitTimeoutMs: 1_000,
     });
+    const session = await env.createSession();
 
     try {
-      const submit = env.submit({
+      const submit = session.submit({
         invocationId,
         toolName: 'Read',
         arguments: { path: 'missing.txt' },
@@ -676,10 +646,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
         JSON.stringify({
           type: 'tool.invocation.failed',
           invocationId,
-          sessionId: env.session.id,
+          sessionId: session.session.id,
           result: {
             invocationId,
-            sessionId: env.session.id,
+            sessionId: session.session.id,
             toolName: 'Read',
             status: 'success',
             output: 'wrong event type',
@@ -712,11 +682,12 @@ describe('ExecutionerEnvironment file queue validation', () => {
       host: { kind: 'managed', stateDir },
       worker: { kind: 'external' },
       lifecycle: { cleanupQueueOnClose: false, cleanupStateOnClose: false },
-      submitTimeoutMs: 100,
+      submitTimeoutMs: 1_000,
     });
+    const session = await env.createSession();
 
     try {
-      const submit = env.submit({
+      const submit = session.submit({
         invocationId,
         toolName: 'Read',
         arguments: { path: 'missing.txt' },
@@ -729,10 +700,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
         JSON.stringify({
           type: 'tool.invocation.completed',
           invocationId,
-          sessionId: env.session.id,
+          sessionId: session.session.id,
           result: {
             invocationId,
-            sessionId: env.session.id,
+            sessionId: session.session.id,
             toolName: 'Read',
             status: 'success',
             output: 'forged without a lease',
@@ -767,9 +738,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
       lifecycle: { cleanupQueueOnClose: false, cleanupStateOnClose: false },
       submitTimeoutMs: 1_000,
     });
+    const session = await env.createSession();
 
     try {
-      const submit = env.submit({
+      const submit = session.submit({
         invocationId,
         toolName: 'Read',
         arguments: { path: 'missing.txt' },
@@ -782,12 +754,12 @@ describe('ExecutionerEnvironment file queue validation', () => {
         JSON.stringify({
           type: 'tool.invocation.completed',
           invocationId,
-          sessionId: env.session.id,
+          sessionId: session.session.id,
           attemptId: 'attempt_forged',
           leaseToken: 'lease_forged',
           result: {
             invocationId,
-            sessionId: env.session.id,
+            sessionId: session.session.id,
             toolName: 'Read',
             status: 'success',
             output: 'forged without a claim',
@@ -822,9 +794,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
       lifecycle: { cleanupQueueOnClose: false, cleanupStateOnClose: false },
       submitTimeoutMs: 1_000,
     });
+    const session = await env.createSession();
 
     try {
-      const submit = env.submit({
+      const submit = session.submit({
         invocationId,
         toolName: 'Read',
         arguments: { path: 'missing.txt' },
@@ -837,7 +810,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
         JSON.stringify({
           type: 'tool.invocation.completed',
           invocationId,
-          sessionId: env.session.id,
+          sessionId: session.session.id,
           error: {
             code: 'wrong_type',
             message: 'wrong event type',
@@ -868,9 +841,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
       lifecycle: { cleanupQueueOnClose: false, cleanupStateOnClose: false },
       submitTimeoutMs: 1_000,
     });
+    const session = await env.createSession();
 
     try {
-      const submit = env.submit({
+      const submit = session.submit({
         invocationId,
         toolName: 'Read',
         arguments: { path: 'missing.txt' },
@@ -883,7 +857,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
         JSON.stringify({
           type: 'tool.invocation.failed',
           invocationId,
-          sessionId: env.session.id,
+          sessionId: session.session.id,
           error: {
             code: 'forged',
             message: 'forged without a lease',
@@ -914,9 +888,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
       lifecycle: { cleanupQueueOnClose: false, cleanupStateOnClose: false },
       submitTimeoutMs: 1_000,
     });
+    const session = await env.createSession();
 
     try {
-      const submit = env.submit({
+      const submit = session.submit({
         invocationId,
         toolName: 'Read',
         arguments: { path: 'missing.txt' },
@@ -929,7 +904,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
         JSON.stringify({
           type: 'tool.invocation.failed',
           invocationId,
-          sessionId: env.session.id,
+          sessionId: session.session.id,
           attemptId: 'attempt_forged',
           leaseToken: 'lease_forged',
           error: {
@@ -963,9 +938,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
         lifecycle: { cleanupQueueOnClose: false, cleanupStateOnClose: false },
         submitTimeoutMs: 100,
       });
+    const session = await env.createSession();
 
       try {
-        const submit = env.submit({
+        const submit = session.submit({
           invocationId,
           toolName: 'Read',
           arguments: { path: 'missing.txt' },
@@ -980,12 +956,12 @@ describe('ExecutionerEnvironment file queue validation', () => {
             ? {
                 type: 'tool.invocation.completed',
                 invocationId,
-                sessionId: env.session.id,
+                sessionId: session.session.id,
                 attemptId: 'attempt',
                 leaseToken: 'lease',
                 result: {
                   invocationId,
-                  sessionId: env.session.id,
+                  sessionId: session.session.id,
                   toolName: 'Read',
                   status: 'success',
                   output: 'forged behind malformed claim',
@@ -1000,7 +976,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
             : {
                 type: 'tool.invocation.failed',
                 invocationId,
-                sessionId: env.session.id,
+                sessionId: session.session.id,
                 attemptId: 'attempt',
                 leaseToken: 'lease',
                 error: {
@@ -1036,9 +1012,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
       lifecycle: { cleanupQueueOnClose: false, cleanupStateOnClose: false },
       submitTimeoutMs: 100,
     });
+    const session = await env.createSession();
 
     try {
-      const submit = env.submit({
+      const submit = session.submit({
         invocationId,
         toolName: 'Read',
         arguments: { path: 'missing.txt' },
@@ -1062,12 +1039,12 @@ describe('ExecutionerEnvironment file queue validation', () => {
         JSON.stringify({
           type: 'tool.invocation.completed',
           invocationId,
-          sessionId: env.session.id,
+          sessionId: session.session.id,
           attemptId: 'attempt',
           leaseToken: 'lease',
           result: {
             invocationId,
-            sessionId: env.session.id,
+            sessionId: session.session.id,
             toolName: 'Read',
             status: 'success',
             output: 'forged behind malformed claim request',
@@ -1104,9 +1081,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
       lifecycle: { cleanupQueueOnClose: false, cleanupStateOnClose: false },
       submitTimeoutMs: 1_000,
     });
+    const session = await env.createSession();
 
     try {
-      const submit = env.submit({
+      const submit = session.submit({
         invocationId,
         toolName: 'Read',
         arguments: { path: 'missing.txt' },
@@ -1119,10 +1097,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
         JSON.stringify({
           type: 'tool.invocation.completed',
           invocationId,
-          sessionId: env.session.id,
+          sessionId: session.session.id,
           result: {
             invocationId,
-            sessionId: env.session.id,
+            sessionId: session.session.id,
             toolName: 'Read',
             output: 'accepted without status',
             error: null,
@@ -1156,9 +1134,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
       lifecycle: { cleanupQueueOnClose: false, cleanupStateOnClose: false },
       submitTimeoutMs: 1_000,
     });
+    const session = await env.createSession();
 
     try {
-      const submit = env.submit({
+      const submit = session.submit({
         invocationId,
         toolName: 'Read',
         arguments: { path: 'missing.txt' },
@@ -1171,10 +1150,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
         JSON.stringify({
           type: 'tool.invocation.completed',
           invocationId,
-          sessionId: env.session.id,
+          sessionId: session.session.id,
           result: {
             invocationId,
-            sessionId: env.session.id,
+            sessionId: session.session.id,
             toolName: 'Read',
             status: 'success',
             output: 'accepted with unknowns',
@@ -1227,9 +1206,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
       lifecycle: { cleanupQueueOnClose: false, cleanupStateOnClose: false },
       submitTimeoutMs: 1_000,
     });
+    const session = await env.createSession();
 
     try {
-      const submit = env.submit({
+      const submit = session.submit({
         invocationId,
         toolName: 'Read',
         arguments: { path: 'missing.txt' },
@@ -1242,10 +1222,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
         JSON.stringify({
           type: 'tool.invocation.completed',
           invocationId,
-          sessionId: env.session.id,
+          sessionId: session.session.id,
           result: {
             invocationId,
-            sessionId: env.session.id,
+            sessionId: session.session.id,
             toolName: 'Read',
             status: 'success',
             output: 'accepted with wrapper padding',
@@ -1281,9 +1261,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
       lifecycle: { cleanupQueueOnClose: false, cleanupStateOnClose: false },
       submitTimeoutMs: 1_000,
     });
+    const session = await env.createSession();
 
     try {
-      const submit = env.submit({
+      const submit = session.submit({
         invocationId,
         toolName: 'Read',
         arguments: { path: 'missing.txt' },
@@ -1296,7 +1277,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
         JSON.stringify({
           type: 'tool.invocation.failed',
           invocationId,
-          sessionId: env.session.id,
+          sessionId: session.session.id,
           error: 'not an error object',
           failedAt: 'now',
         }),
@@ -1348,10 +1329,11 @@ describe('ExecutionerEnvironment file queue validation', () => {
       lifecycle: { cleanupQueueOnClose: false, cleanupStateOnClose: false },
       submitTimeoutMs: 1_000,
     });
+    const session = await env.createSession();
 
     try {
       for (const testCase of cases) {
-        const submit = env.submit({
+        const submit = session.submit({
           invocationId: testCase.invocationId,
           toolName: 'Read',
           arguments: { path: 'missing.txt' },
@@ -1364,7 +1346,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
           JSON.stringify({
             type: 'tool.invocation.failed',
             invocationId: testCase.invocationId,
-            sessionId: env.session.id,
+            sessionId: session.session.id,
             failedAt: 'now',
             ...testCase.event,
           }),
@@ -1392,9 +1374,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
       lifecycle: { cleanupQueueOnClose: false, cleanupStateOnClose: false },
       submitTimeoutMs: 1_000,
     });
+    const session = await env.createSession();
 
     try {
-      const submit = env.submit({
+      const submit = session.submit({
         invocationId,
         toolName: 'Read',
         arguments: { path: 'missing.txt' },
@@ -1407,7 +1390,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
         JSON.stringify({
           type: 'tool.invocation.failed',
           invocationId,
-          sessionId: env.session.id,
+          sessionId: session.session.id,
           error: {
             message: 'missing code',
             retryable: false,
@@ -1436,9 +1419,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
       lifecycle: { cleanupQueueOnClose: false, cleanupStateOnClose: false },
       submitTimeoutMs: 1_000,
     });
+    const session = await env.createSession();
 
     try {
-      const list = env.listFiles();
+      const list = session.listFiles();
       const pending = await waitForPendingInvocation(queueDir);
       await claimPendingInvocation(queueDir, pending.invocationId);
       await writeFile(
@@ -1446,12 +1430,12 @@ describe('ExecutionerEnvironment file queue validation', () => {
         JSON.stringify({
           type: 'tool.invocation.completed',
           invocationId: pending.invocationId,
-          sessionId: env.session.id,
+          sessionId: session.session.id,
           attemptId: 'attempt',
           leaseToken: 'lease',
           result: {
             invocationId: pending.invocationId,
-            sessionId: env.session.id,
+            sessionId: session.session.id,
             toolName: 'List',
             status: 'success',
             output: 'line\nbreak.txt',
@@ -1483,9 +1467,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
       lifecycle: { cleanupQueueOnClose: false, cleanupStateOnClose: false },
       submitTimeoutMs: 1_000,
     });
+    const session = await env.createSession();
 
     try {
-      const list = env.list({ cwd: '/workspace/src' });
+      const list = session.list({ cwd: '/workspace/src' });
       const pending = await waitForPendingInvocation(queueDir);
       expect(pending.invocationId).toBeTruthy();
       const request = JSON.parse(await readFile(join(queueDir, 'pending', `${pending.invocationId}.json`), 'utf8'));
@@ -1497,12 +1482,12 @@ describe('ExecutionerEnvironment file queue validation', () => {
         JSON.stringify({
           type: 'tool.invocation.completed',
           invocationId: pending.invocationId,
-          sessionId: env.session.id,
+          sessionId: session.session.id,
           attemptId: 'attempt',
           leaseToken: 'lease',
           result: {
             invocationId: pending.invocationId,
-            sessionId: env.session.id,
+            sessionId: session.session.id,
             toolName: 'List',
             status: 'success',
             output: 'main.ts',
@@ -1534,9 +1519,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
       lifecycle: { cleanupQueueOnClose: false, cleanupStateOnClose: false },
       submitTimeoutMs: 1_000,
     });
+    const session = await env.createSession();
 
     try {
-      const list = env.listFiles().catch((error: Error) => error);
+      const list = session.listFiles().catch((error: Error) => error);
       const pending = await waitForPendingInvocation(queueDir);
       await claimPendingInvocation(queueDir, pending.invocationId);
       await writeFile(
@@ -1544,12 +1530,12 @@ describe('ExecutionerEnvironment file queue validation', () => {
         JSON.stringify({
           type: 'tool.invocation.completed',
           invocationId: pending.invocationId,
-          sessionId: env.session.id,
+          sessionId: session.session.id,
           attemptId: 'attempt',
           leaseToken: 'lease',
           result: {
             invocationId: pending.invocationId,
-            sessionId: env.session.id,
+            sessionId: session.session.id,
             toolName: 'List',
             status: 'success',
             output: 'fallback.txt',
@@ -1583,9 +1569,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
       lifecycle: { cleanupQueueOnClose: false, cleanupStateOnClose: false },
       submitTimeoutMs: 1_000,
     });
+    const session = await env.createSession();
 
     try {
-      const list = env.listFiles().catch((error: Error) => error);
+      const list = session.listFiles().catch((error: Error) => error);
       const pending = await waitForPendingInvocation(queueDir);
       await claimPendingInvocation(queueDir, pending.invocationId);
       await writeFile(
@@ -1593,12 +1580,12 @@ describe('ExecutionerEnvironment file queue validation', () => {
         JSON.stringify({
           type: 'tool.invocation.completed',
           invocationId: pending.invocationId,
-          sessionId: env.session.id,
+          sessionId: session.session.id,
           attemptId: 'attempt',
           leaseToken: 'lease',
           result: {
             invocationId: pending.invocationId,
-            sessionId: env.session.id,
+            sessionId: session.session.id,
             toolName: 'List',
             status: 'success',
             output: 'fallback.txt',
@@ -1632,9 +1619,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
       lifecycle: { cleanupQueueOnClose: false, cleanupStateOnClose: false },
       submitTimeoutMs: 1_000,
     });
+    const session = await env.createSession();
 
     try {
-      const list = env.listFiles().catch((error: Error) => error);
+      const list = session.listFiles().catch((error: Error) => error);
       const pending = await waitForPendingInvocation(queueDir);
       await claimPendingInvocation(queueDir, pending.invocationId);
       await writeFile(
@@ -1642,12 +1630,12 @@ describe('ExecutionerEnvironment file queue validation', () => {
         JSON.stringify({
           type: 'tool.invocation.completed',
           invocationId: pending.invocationId,
-          sessionId: env.session.id,
+          sessionId: session.session.id,
           attemptId: 'attempt',
           leaseToken: 'lease',
           result: {
             invocationId: pending.invocationId,
-            sessionId: env.session.id,
+            sessionId: session.session.id,
             toolName: 'List',
             status: 'success',
             output: 'visible.txt\n...[truncated at 1000 entries, 1005 total]',
@@ -1681,9 +1669,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
       lifecycle: { cleanupQueueOnClose: false, cleanupStateOnClose: false },
       submitTimeoutMs: 1_000,
     });
+    const session = await env.createSession();
 
     try {
-      const list = env.listFiles().catch((error: Error) => error);
+      const list = session.listFiles().catch((error: Error) => error);
       const pending = await waitForPendingInvocation(queueDir);
       await claimPendingInvocation(queueDir, pending.invocationId);
       await writeFile(
@@ -1691,12 +1680,12 @@ describe('ExecutionerEnvironment file queue validation', () => {
         JSON.stringify({
           type: 'tool.invocation.completed',
           invocationId: pending.invocationId,
-          sessionId: env.session.id,
+          sessionId: session.session.id,
           attemptId: 'attempt',
           leaseToken: 'lease',
           result: {
             invocationId: pending.invocationId,
-            sessionId: env.session.id,
+            sessionId: session.session.id,
             toolName: 'List',
             status: 'success',
             output: 'visible.txt',
@@ -1730,9 +1719,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
       lifecycle: { cleanupQueueOnClose: false, cleanupStateOnClose: false },
       submitTimeoutMs: 1_000,
     });
+    const session = await env.createSession();
 
     try {
-      const list = env.listFiles().catch((error: Error) => error);
+      const list = session.listFiles().catch((error: Error) => error);
       const pending = await waitForPendingInvocation(queueDir);
       await claimPendingInvocation(queueDir, pending.invocationId);
       await writeFile(
@@ -1740,12 +1730,12 @@ describe('ExecutionerEnvironment file queue validation', () => {
         JSON.stringify({
           type: 'tool.invocation.completed',
           invocationId: pending.invocationId,
-          sessionId: env.session.id,
+          sessionId: session.session.id,
           attemptId: 'attempt',
           leaseToken: 'lease',
           result: {
             invocationId: pending.invocationId,
-            sessionId: env.session.id,
+            sessionId: session.session.id,
             toolName: 'List',
             status: 'success',
             output: 'visible.txt\n...[truncated at 1000 entries, 1005 total]',
@@ -1779,9 +1769,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
       lifecycle: { cleanupQueueOnClose: false, cleanupStateOnClose: false },
       submitTimeoutMs: 1_000,
     });
+    const session = await env.createSession();
 
     try {
-      const list = env.listFiles();
+      const list = session.listFiles();
       const pending = await waitForPendingInvocation(queueDir);
       await claimPendingInvocation(queueDir, pending.invocationId);
       await writeFile(
@@ -1789,12 +1780,12 @@ describe('ExecutionerEnvironment file queue validation', () => {
         JSON.stringify({
           type: 'tool.invocation.completed',
           invocationId: pending.invocationId,
-          sessionId: env.session.id,
+          sessionId: session.session.id,
           attemptId: 'attempt',
           leaseToken: 'lease',
           result: {
             invocationId: pending.invocationId,
-            sessionId: env.session.id,
+            sessionId: session.session.id,
             toolName: 'List',
             status: 'success',
             output: 'No files found matching pattern: notes.txt',
@@ -1826,9 +1817,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
       lifecycle: { cleanupQueueOnClose: false, cleanupStateOnClose: false },
       submitTimeoutMs: 1_000,
     });
+    const session = await env.createSession();
 
     try {
-      const list = env.listFiles().catch((error: Error) => error);
+      const list = session.listFiles().catch((error: Error) => error);
       const pending = await waitForPendingInvocation(queueDir);
       await claimPendingInvocation(queueDir, pending.invocationId);
       await writeFile(
@@ -1836,12 +1828,12 @@ describe('ExecutionerEnvironment file queue validation', () => {
         JSON.stringify({
           type: 'tool.invocation.completed',
           invocationId: pending.invocationId,
-          sessionId: env.session.id,
+          sessionId: session.session.id,
           attemptId: 'attempt',
           leaseToken: 'lease',
           result: {
             invocationId: pending.invocationId,
-            sessionId: env.session.id,
+            sessionId: session.session.id,
             toolName: 'List',
             status: 'success',
             output: 'visible.txt',
@@ -1875,9 +1867,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
       lifecycle: { cleanupQueueOnClose: false, cleanupStateOnClose: false },
       submitTimeoutMs: 1_000,
     });
+    const session = await env.createSession();
 
     try {
-      const list = env.listFiles();
+      const list = session.listFiles();
       const pending = await waitForPendingInvocation(queueDir);
       await claimPendingInvocation(queueDir, pending.invocationId);
       await writeFile(
@@ -1885,12 +1878,12 @@ describe('ExecutionerEnvironment file queue validation', () => {
         JSON.stringify({
           eventType: 'tool.invocation.completed',
           invocationId: pending.invocationId,
-          sessionId: env.session.id,
+          sessionId: session.session.id,
           attemptId: 'attempt',
           leaseToken: 'lease',
           result: {
             invocationId: pending.invocationId,
-            sessionId: env.session.id,
+            sessionId: session.session.id,
             toolName: 'List',
             status: 'success',
             output: 'from-rust-worker.txt',
@@ -1910,7 +1903,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
     }
   });
 
-  test('create rejects invalid returned session id', async () => {
+  test('create rejects invalid returned environment id', async () => {
     const root = await mkdtemp(join(tmpdir(), 'executioner-js-test-'));
     cleanup.push(root);
     const queueDir = join(root, 'queue');
@@ -1918,9 +1911,9 @@ describe('ExecutionerEnvironment file queue validation', () => {
       port: 0,
       fetch(request) {
         const url = new URL(request.url);
-        if (url.pathname === '/sessions') {
+        if (url.pathname === '/environments') {
           return Response.json({
-            session: {
+            environment: {
               id: '../escaped',
               state: 'ready',
               workspace: {
@@ -1931,6 +1924,8 @@ describe('ExecutionerEnvironment file queue validation', () => {
                 managed: true,
               },
               createdAt: 'now',
+              revision: 0,
+              metadata: {},
             },
           });
         }
@@ -1944,7 +1939,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
         host: { kind: 'http', baseUrl: `http://127.0.0.1:${server.port}/` },
         worker: { kind: 'external' },
         lifecycle: { cleanupQueueOnClose: false, cleanupStateOnClose: false },
-      })).rejects.toThrow('Invalid session id');
+      })).rejects.toThrow('Invalid environment id');
     } finally {
       server.stop(true);
     }
@@ -1958,7 +1953,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
       port: 0,
       fetch(request) {
         const url = new URL(request.url);
-        if (url.pathname === '/sessions') {
+        if (url.pathname === '/environments') {
           return new Response('x'.repeat(256 * 1024), { status: 500 });
         }
         return new Response('not found', { status: 404 });
@@ -1989,7 +1984,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
       port: 0,
       fetch(request) {
         const url = new URL(request.url);
-        if (url.pathname === '/sessions') {
+        if (url.pathname === '/environments') {
           return Response.json({ padding: 'x'.repeat(11 * 1024 * 1024) });
         }
         return new Response('not found', { status: 404 });
@@ -2018,7 +2013,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
       fetch() {
         captured = true;
         return Response.json({
-          session: {
+          environment: {
             id: 'sess_redirected',
             state: 'ready',
             workspace: {
@@ -2029,6 +2024,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
               managed: true,
             },
             createdAt: 'now',
+            revision: 0,
             metadata: {},
           },
         });
@@ -2038,7 +2034,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
       port: 0,
       fetch(request) {
         const url = new URL(request.url);
-        if (url.pathname === '/sessions') {
+        if (url.pathname === '/environments') {
           return new Response(null, {
             status: 307,
             headers: { location: `http://127.0.0.1:${captureServer.port}/capture` },
@@ -2063,7 +2059,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
     }
   });
 
-  test('create rejects malformed session booleans instead of coercing', async () => {
+  test('create rejects malformed environment booleans instead of coercing', async () => {
     const root = await mkdtemp(join(tmpdir(), 'executioner-js-test-'));
     cleanup.push(root);
     const queueDir = join(root, 'queue');
@@ -2071,9 +2067,9 @@ describe('ExecutionerEnvironment file queue validation', () => {
       port: 0,
       fetch(request) {
         const url = new URL(request.url);
-        if (url.pathname === '/sessions') {
+        if (url.pathname === '/environments') {
           return Response.json({
-            session: {
+            environment: {
               id: 'sess_malformed_bool',
               state: 'ready',
               workspace: {
@@ -2084,6 +2080,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
                 managed: true,
               },
               createdAt: 'now',
+              revision: 0,
               metadata: {},
             },
           });
@@ -2104,7 +2101,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
     }
   });
 
-  test('create rejects missing required session fields instead of defaulting', async () => {
+  test('create rejects missing required environment fields instead of defaulting', async () => {
     const root = await mkdtemp(join(tmpdir(), 'executioner-js-test-'));
     cleanup.push(root);
     const queueDir = join(root, 'queue');
@@ -2112,9 +2109,9 @@ describe('ExecutionerEnvironment file queue validation', () => {
       port: 0,
       fetch(request) {
         const url = new URL(request.url);
-        if (url.pathname === '/sessions') {
+        if (url.pathname === '/environments') {
           return Response.json({
-            session: {
+            environment: {
               id: 'sess_missing_workspace_root',
               state: 'ready',
               workspace: {
@@ -2124,6 +2121,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
                 managed: true,
               },
               createdAt: 'now',
+              revision: 0,
               metadata: {},
             },
           });
@@ -2158,28 +2156,29 @@ describe('ExecutionerEnvironment file queue validation', () => {
         managed: true,
       },
       createdAt: 'now',
+      revision: 0,
       metadata: {},
     };
     const cases = [
       {
         name: 'response',
         payload: { session: baseSession, padding: 'unexpected' },
-        message: 'unknown create session response field',
+        message: 'unknown create environment response field',
       },
       {
         name: 'session',
-        payload: { session: { ...baseSession, padding: 'unexpected' } },
-        message: 'unknown session field',
+        payload: { environment: { ...baseSession, padding: 'unexpected' } },
+        message: 'unknown environment field',
       },
       {
         name: 'workspace',
         payload: {
-          session: {
+          environment: {
             ...baseSession,
             workspace: { ...baseSession.workspace, padding: 'unexpected' },
           },
         },
-        message: 'unknown session workspace field',
+        message: 'unknown environment workspace field',
       },
     ];
 
@@ -2189,7 +2188,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
         port: 0,
         fetch(request) {
           const url = new URL(request.url);
-          if (url.pathname === '/sessions') {
+          if (url.pathname === '/environments') {
             return Response.json(testCase.payload);
           }
           return new Response('not found', { status: 404 });
@@ -2223,18 +2222,19 @@ describe('ExecutionerEnvironment file queue validation', () => {
         managed: true,
       },
       createdAt: 'now',
+      revision: 0,
       metadata: {},
     };
     const cases = [
       {
         name: 'state',
-        payload: { session: { ...baseSession, state: 'rooted' } },
-        message: 'unknown session state',
+        payload: { environment: { ...baseSession, state: 'rooted' } },
+        message: 'unknown environment state',
       },
       {
         name: 'mode',
         payload: {
-          session: {
+          environment: {
             ...baseSession,
             workspace: { ...baseSession.workspace, mode: 'mounted' },
           },
@@ -2249,7 +2249,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
         port: 0,
         fetch(request) {
           const url = new URL(request.url);
-          if (url.pathname === '/sessions') {
+          if (url.pathname === '/environments') {
             return Response.json(testCase.payload);
           }
           return new Response('not found', { status: 404 });
@@ -2281,9 +2281,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
       lifecycle: { cleanupQueueOnClose: false, cleanupStateOnClose: false },
       submitTimeoutMs: 1_000,
     });
+    const session = await env.createSession();
 
     try {
-      const list = env.listFiles().catch((error: Error) => error);
+      const list = session.listFiles().catch((error: Error) => error);
       const pending = await waitForPendingInvocation(queueDir);
       await claimPendingInvocation(queueDir, pending.invocationId);
       await writeFile(
@@ -2291,12 +2292,12 @@ describe('ExecutionerEnvironment file queue validation', () => {
         JSON.stringify({
           type: 'tool.invocation.completed',
           invocationId: pending.invocationId,
-          sessionId: env.session.id,
+          sessionId: session.session.id,
           attemptId: 'attempt',
           leaseToken: 'lease',
           result: {
             invocationId: pending.invocationId,
-            sessionId: env.session.id,
+            sessionId: session.session.id,
             toolName: 'List',
             status: 'policy_denied',
             output: '',
@@ -2330,9 +2331,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
       lifecycle: { cleanupQueueOnClose: false, cleanupStateOnClose: false },
       submitTimeoutMs: 50,
     });
+    const session = await env.createSession();
 
     try {
-      await expect(env.listFiles({
+      await expect(session.listFiles({
         cwd: '/workspace',
         recursive: true,
       } as unknown as ListFilesOptions)).rejects.toThrow('unknown listFiles options field');
@@ -2355,9 +2357,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
       lifecycle: { cleanupQueueOnClose: false, cleanupStateOnClose: false },
       submitTimeoutMs: 50,
     });
+    const session = await env.createSession();
 
     try {
-      const list = env.listFiles().catch((error: Error) => error);
+      const list = session.listFiles().catch((error: Error) => error);
       const pending = await waitForPendingInvocation(queueDir);
       await claimPendingInvocation(queueDir, pending.invocationId);
       await writeFile(
@@ -2365,10 +2368,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
         JSON.stringify({
           type: 'tool.invocation.completed',
           invocationId: pending.invocationId,
-          sessionId: env.session.id,
+          sessionId: session.session.id,
           result: {
             invocationId: pending.invocationId,
-            sessionId: env.session.id,
+            sessionId: session.session.id,
             toolName: 'List',
             status: 'success',
             output: 'forged outside queue',
@@ -2406,9 +2409,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
       lifecycle: { cleanupQueueOnClose: false, cleanupStateOnClose: false },
       submitTimeoutMs: 100,
     });
+    const session = await env.createSession();
 
     try {
-      const list = env.listFiles().catch((error: Error) => error);
+      const list = session.listFiles().catch((error: Error) => error);
       const pending = await waitForPendingInvocation(queueDir);
       await claimPendingInvocation(queueDir, pending.invocationId);
       await writeFile(
@@ -2416,12 +2420,12 @@ describe('ExecutionerEnvironment file queue validation', () => {
         JSON.stringify({
           type: 'tool.invocation.completed',
           invocationId: pending.invocationId,
-          sessionId: env.session.id,
+          sessionId: session.session.id,
           attemptId: 'attempt',
           leaseToken: 'lease',
           result: {
             invocationId: pending.invocationId,
-            sessionId: env.session.id,
+            sessionId: session.session.id,
             toolName: 'Read',
             status: 'success',
             output: 'forged.txt',
@@ -2457,9 +2461,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
       lifecycle: { cleanupQueueOnClose: false, cleanupStateOnClose: false },
       submitTimeoutMs: 1_000,
     });
+    const session = await env.createSession();
 
     try {
-      await expect(env.submit({
+      await expect(session.submit({
         invocationId: 'js_empty_tool',
         toolName: '',
         arguments: {},
@@ -2482,51 +2487,52 @@ describe('ExecutionerEnvironment file queue validation', () => {
       lifecycle: { cleanupQueueOnClose: false, cleanupStateOnClose: false },
       submitTimeoutMs: 50,
     });
+    const session = await env.createSession();
 
     try {
-      await expect(env.submit({
+      await expect(session.submit({
         invocationId: 'js_bad_cwd',
         toolName: 'Read',
         arguments: { path: 'missing.txt' },
         cwd: 42 as unknown as string,
       })).rejects.toThrow('cwd must be a string');
-      await expect(env.submit({
+      await expect(session.submit({
         invocationId: 'js_bad_metadata',
         toolName: 'Read',
         arguments: { path: 'missing.txt' },
         metadata: 'not metadata' as unknown as Record<string, unknown>,
       })).rejects.toThrow('metadata must be a JSON object');
-      await expect(env.submit({
+      await expect(session.submit({
         invocationId: 'js_bad_timeout',
         toolName: 'Read',
         arguments: { path: 'missing.txt' },
         timeoutMs: -1,
       })).rejects.toThrow('timeoutMs must be non-negative');
-      await expect(env.submit({
+      await expect(session.submit({
         invocationId: 'js_zero_timeout',
         toolName: 'Read',
         arguments: { path: 'missing.txt' },
         timeoutMs: 0,
       })).rejects.toThrow('timeoutMs must be positive');
-      await expect(env.submit({
+      await expect(session.submit({
         invocationId: 'js_bad_timeout_cap',
         toolName: 'Read',
         arguments: { path: 'missing.txt' },
         timeoutMs: 60 * 60 * 1000 + 1,
       })).rejects.toThrow('timeoutMs exceeds maximum supported tool timeout');
-      await expect(env.submit({
+      await expect(session.submit({
         invocationId: 'js_bad_output_limit',
         toolName: 'Read',
         arguments: { path: 'missing.txt' },
         maxOutputBytes: 10 * 1024 * 1024 + 1,
       })).rejects.toThrow('maxOutputBytes exceeds maximum supported output size');
-      await expect(env.submit({
+      await expect(session.submit({
         invocationId: 'js_bad_unknown',
         toolName: 'Read',
         arguments: { path: 'missing.txt' },
         requiredCapabilities: [{ kind: 'file.read' }],
       } as unknown as ToolCall)).rejects.toThrow('unknown tool call field');
-      await expect(env.submit({
+      await expect(session.submit({
         invocationId: 'js_oversized_request',
         toolName: 'Read',
         arguments: { path: 'missing.txt' },
@@ -2555,9 +2561,9 @@ describe('ExecutionerEnvironment file queue validation', () => {
       port: 0,
       fetch(request) {
         const url = new URL(request.url);
-        if (request.method === 'POST' && url.pathname === '/sessions') {
+        if (request.method === 'POST' && url.pathname === '/environments') {
           return Response.json({
-            session: {
+            environment: {
               id: 'sess_swapped_queue',
               state: 'ready',
               workspace: {
@@ -2568,14 +2574,16 @@ describe('ExecutionerEnvironment file queue validation', () => {
                 managed: true,
               },
               createdAt: 'now',
+              revision: 0,
+              metadata: {},
             },
           });
         }
-        if (request.method === 'DELETE' && url.pathname === '/sessions/sess_swapped_queue') {
+        if (request.method === 'POST' && url.pathname === '/environments/sess_swapped_queue/sessions') {
           return Response.json({
             session: {
-              id: 'sess_swapped_queue',
-              state: 'destroyed',
+              id: 'sess_swapped_queue_session',
+              state: 'ready',
               workspace: {
                 root: '/tmp/workspace',
                 logicalRoot: '/workspace',
@@ -2584,7 +2592,24 @@ describe('ExecutionerEnvironment file queue validation', () => {
                 managed: true,
               },
               createdAt: 'now',
+              metadata: {},
             },
+          });
+        }
+        if (request.method === 'DELETE' && url.pathname === '/environments/sess_swapped_queue') {
+          return Response.json({
+            id: 'sess_swapped_queue',
+            state: 'destroyed',
+            workspace: {
+              root: '/tmp/workspace',
+              logicalRoot: '/workspace',
+              mode: 'new',
+              fresh: true,
+              managed: true,
+            },
+            createdAt: 'now',
+            revision: 0,
+            metadata: {},
           });
         }
         return new Response('not found', { status: 404 });
@@ -2597,13 +2622,14 @@ describe('ExecutionerEnvironment file queue validation', () => {
       lifecycle: { cleanupQueueOnClose: false, cleanupStateOnClose: false },
       submitTimeoutMs: 50,
     });
+    const session = await env.createSession();
 
     try {
       await mkdir(outsidePending);
       await rm(join(queueDir, 'pending'), { recursive: true, force: true });
       await symlink(outsidePending, join(queueDir, 'pending'));
 
-      await expect(env.submit({
+      await expect(session.submit({
         invocationId: 'js_swapped_pending',
         toolName: 'Read',
         arguments: { path: 'missing.txt' },
@@ -2623,9 +2649,9 @@ describe('ExecutionerEnvironment file queue validation', () => {
       port: 0,
       fetch(request) {
         const url = new URL(request.url);
-        if (request.method === 'POST' && url.pathname === '/sessions') {
+        if (request.method === 'POST' && url.pathname === '/environments') {
           return Response.json({
-            session: {
+            environment: {
               id: 'sess_close_failure',
               state: 'ready',
               workspace: {
@@ -2636,10 +2662,12 @@ describe('ExecutionerEnvironment file queue validation', () => {
                 managed: true,
               },
               createdAt: 'now',
+              revision: 0,
+              metadata: {},
             },
           });
         }
-        if (request.method === 'DELETE' && url.pathname === '/sessions/sess_close_failure') {
+        if (request.method === 'DELETE' && url.pathname === '/environments/sess_close_failure') {
           return new Response('destroy failed', { status: 500 });
         }
         return new Response('not found', { status: 404 });
@@ -2669,10 +2697,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
       port: 0,
       fetch(request) {
         const url = new URL(request.url);
-        if (request.method === 'POST' && url.pathname === '/sessions') {
+        if (request.method === 'POST' && url.pathname === '/environments') {
           events.push('create');
           return Response.json({
-            session: {
+            environment: {
               id: 'sess_partial_worker_spawn',
               state: 'ready',
               workspace: {
@@ -2683,11 +2711,12 @@ describe('ExecutionerEnvironment file queue validation', () => {
                 managed: true,
               },
               createdAt: 'now',
+              revision: 0,
               metadata: {},
             },
           });
         }
-        if (request.method === 'DELETE' && url.pathname === '/sessions/sess_partial_worker_spawn') {
+        if (request.method === 'DELETE' && url.pathname === '/environments/sess_partial_worker_spawn') {
           events.push('destroy');
           return Response.json({
             id: 'sess_partial_worker_spawn',
@@ -2700,6 +2729,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
               managed: true,
             },
             createdAt: 'now',
+            revision: 0,
             metadata: {},
           });
         }
@@ -2733,9 +2763,9 @@ describe('ExecutionerEnvironment file queue validation', () => {
       port: 0,
       fetch(request) {
         const url = new URL(request.url);
-        if (request.method === 'POST' && url.pathname === '/sessions') {
+        if (request.method === 'POST' && url.pathname === '/environments') {
           return Response.json({
-            session: {
+            environment: {
               id: 'sess_queue_preserve',
               state: 'ready',
               workspace: {
@@ -2746,10 +2776,12 @@ describe('ExecutionerEnvironment file queue validation', () => {
                 managed: true,
               },
               createdAt: 'now',
+              revision: 0,
+              metadata: {},
             },
           });
         }
-        if (request.method === 'DELETE' && url.pathname === '/sessions/sess_queue_preserve') {
+        if (request.method === 'DELETE' && url.pathname === '/environments/sess_queue_preserve') {
           return Response.json({
             id: 'sess_queue_preserve',
             state: 'destroyed',
@@ -2761,6 +2793,8 @@ describe('ExecutionerEnvironment file queue validation', () => {
               managed: true,
             },
             createdAt: 'now',
+            revision: 0,
+            metadata: {},
           });
         }
         return new Response('not found', { status: 404 });
@@ -2794,9 +2828,9 @@ describe('ExecutionerEnvironment file queue validation', () => {
       port: 0,
       fetch(request) {
         const url = new URL(request.url);
-        if (request.method === 'POST' && url.pathname === '/sessions') {
+        if (request.method === 'POST' && url.pathname === '/environments') {
           return Response.json({
-            session: {
+            environment: {
               id: 'sess_queue_symlink_cleanup',
               state: 'ready',
               workspace: {
@@ -2807,10 +2841,12 @@ describe('ExecutionerEnvironment file queue validation', () => {
                 managed: true,
               },
               createdAt: 'now',
+              revision: 0,
+              metadata: {},
             },
           });
         }
-        if (request.method === 'DELETE' && url.pathname === '/sessions/sess_queue_symlink_cleanup') {
+        if (request.method === 'DELETE' && url.pathname === '/environments/sess_queue_symlink_cleanup') {
           return Response.json({
             id: 'sess_queue_symlink_cleanup',
             state: 'destroyed',
@@ -2822,6 +2858,8 @@ describe('ExecutionerEnvironment file queue validation', () => {
               managed: true,
             },
             createdAt: 'now',
+            revision: 0,
+            metadata: {},
           });
         }
         return new Response('not found', { status: 404 });
@@ -2858,9 +2896,9 @@ describe('ExecutionerEnvironment file queue validation', () => {
       port: 0,
       fetch(request) {
         const url = new URL(request.url);
-        if (request.method === 'POST' && url.pathname === '/sessions') {
+        if (request.method === 'POST' && url.pathname === '/environments') {
           return Response.json({
-            session: {
+            environment: {
               id: 'sess_queue_root_symlink_cleanup',
               state: 'ready',
               workspace: {
@@ -2871,10 +2909,12 @@ describe('ExecutionerEnvironment file queue validation', () => {
                 managed: true,
               },
               createdAt: 'now',
+              revision: 0,
+              metadata: {},
             },
           });
         }
-        if (request.method === 'DELETE' && url.pathname === '/sessions/sess_queue_root_symlink_cleanup') {
+        if (request.method === 'DELETE' && url.pathname === '/environments/sess_queue_root_symlink_cleanup') {
           return Response.json({
             id: 'sess_queue_root_symlink_cleanup',
             state: 'destroyed',
@@ -2886,6 +2926,8 @@ describe('ExecutionerEnvironment file queue validation', () => {
               managed: true,
             },
             createdAt: 'now',
+            revision: 0,
+            metadata: {},
           });
         }
         return new Response('not found', { status: 404 });
@@ -2920,7 +2962,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
       port: 0,
       fetch(request) {
         const url = new URL(request.url);
-        if (request.method === 'DELETE' && url.pathname === '/sessions/sess_state_preserve') {
+        if (request.method === 'DELETE' && url.pathname === '/environments/sess_state_preserve') {
           return Response.json({
             id: 'sess_state_preserve',
             state: 'destroyed',
@@ -2932,6 +2974,8 @@ describe('ExecutionerEnvironment file queue validation', () => {
               managed: true,
             },
             createdAt: 'now',
+            revision: 0,
+            metadata: {},
           });
         }
         return new Response('not found', { status: 404 });
@@ -2972,6 +3016,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
           managed: true,
         },
         createdAt: 'now',
+        revision: 0,
         metadata: {},
       },
       [],
@@ -2993,7 +3038,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
       port: 0,
       fetch(request) {
         const url = new URL(request.url);
-        if (request.method === 'DELETE' && url.pathname === '/sessions/sess_close_wait') {
+        if (request.method === 'DELETE' && url.pathname === '/environments/sess_close_wait') {
           return Response.json({
             id: 'sess_close_wait',
             state: 'destroyed',
@@ -3005,6 +3050,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
               managed: true,
             },
             createdAt: 'now',
+            revision: 0,
             metadata: {},
           });
         }
@@ -3059,6 +3105,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
           managed: true,
         },
         createdAt: 'now',
+        revision: 0,
         metadata: {},
       },
       [{ name: 'executioner-worker', process: fakeProcess }],
@@ -3081,7 +3128,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
       port: 0,
       fetch(request) {
         const url = new URL(request.url);
-        if (request.method === 'DELETE' && url.pathname === '/sessions/sess_close_presignaled') {
+        if (request.method === 'DELETE' && url.pathname === '/environments/sess_close_presignaled') {
           return Response.json({
             id: 'sess_close_presignaled',
             state: 'destroyed',
@@ -3093,6 +3140,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
               managed: true,
             },
             createdAt: 'now',
+            revision: 0,
             metadata: {},
           });
         }
@@ -3148,6 +3196,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
           managed: true,
         },
         createdAt: 'now',
+        revision: 0,
         metadata: {},
       },
       [{ name: 'executioner-worker', process: fakeProcess }],
@@ -3170,9 +3219,9 @@ describe('ExecutionerEnvironment file queue validation', () => {
       port: 0,
       fetch(request) {
         const url = new URL(request.url);
-        if (request.method === 'POST' && url.pathname === '/sessions') {
+        if (request.method === 'POST' && url.pathname === '/environments') {
           return Response.json({
-            session: {
+            environment: {
               id: 'sess_bad_artifact',
               state: 'ready',
               workspace: {
@@ -3183,13 +3232,14 @@ describe('ExecutionerEnvironment file queue validation', () => {
                 managed: true,
               },
               createdAt: 'now',
+              revision: 0,
               metadata: {},
             },
           });
         }
-        if (request.method === 'POST' && url.pathname === '/sessions/sess_bad_artifact/artifacts/workspace') {
+        if (request.method === 'POST' && url.pathname === '/environments/sess_bad_artifact/artifacts/workspace') {
           return Response.json({
-            sessionId: 'sess_bad_artifact',
+            environmentId: 'sess_bad_artifact',
             artifact: { resourceType: 'artifact', uri: 'file:///tmp/workspace.tar' },
             manifest: { resourceType: 'artifact_manifest', uri: 'file:///tmp/workspace.manifest.json' },
             format: 'tar',
@@ -3202,7 +3252,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
             createdAt: 'now',
           });
         }
-        if (request.method === 'DELETE' && url.pathname === '/sessions/sess_bad_artifact') {
+        if (request.method === 'DELETE' && url.pathname === '/environments/sess_bad_artifact') {
           return Response.json({
             id: 'sess_bad_artifact',
             state: 'destroyed',
@@ -3214,6 +3264,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
               managed: true,
             },
             createdAt: 'now',
+            revision: 0,
             metadata: {},
           });
         }
@@ -3243,9 +3294,9 @@ describe('ExecutionerEnvironment file queue validation', () => {
       port: 0,
       fetch(request) {
         const url = new URL(request.url);
-        if (request.method === 'POST' && url.pathname === '/sessions') {
+        if (request.method === 'POST' && url.pathname === '/environments') {
           return Response.json({
-            session: {
+            environment: {
               id: 'sess_missing_artifact_hash',
               state: 'ready',
               workspace: {
@@ -3256,13 +3307,14 @@ describe('ExecutionerEnvironment file queue validation', () => {
                 managed: true,
               },
               createdAt: 'now',
+              revision: 0,
               metadata: {},
             },
           });
         }
-        if (request.method === 'POST' && url.pathname === '/sessions/sess_missing_artifact_hash/artifacts/workspace') {
+        if (request.method === 'POST' && url.pathname === '/environments/sess_missing_artifact_hash/artifacts/workspace') {
           return Response.json({
-            sessionId: 'sess_missing_artifact_hash',
+            environmentId: 'sess_missing_artifact_hash',
             artifact: { resourceType: 'artifact', uri: 'file:///tmp/workspace.tar' },
             manifest: { resourceType: 'artifact_manifest', uri: 'file:///tmp/workspace.manifest.json' },
             format: 'tar',
@@ -3274,7 +3326,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
             createdAt: 'now',
           });
         }
-        if (request.method === 'DELETE' && url.pathname === '/sessions/sess_missing_artifact_hash') {
+        if (request.method === 'DELETE' && url.pathname === '/environments/sess_missing_artifact_hash') {
           return Response.json({
             id: 'sess_missing_artifact_hash',
             state: 'destroyed',
@@ -3286,6 +3338,7 @@ describe('ExecutionerEnvironment file queue validation', () => {
               managed: true,
             },
             createdAt: 'now',
+            revision: 0,
             metadata: {},
           });
         }
@@ -3354,9 +3407,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
       lifecycle: { cleanupQueueOnClose: false, cleanupStateOnClose: false },
       submitTimeoutMs: 100,
     });
+    const session = await env.createSession();
 
     try {
-      const submit = env.submit({
+      const submit = session.submit({
         invocationId,
         toolName: 'Read',
         arguments: { path: 'missing.txt' },
@@ -3368,10 +3422,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
         JSON.stringify({
           type: 'tool.invocation.completed',
           invocationId,
-          sessionId: env.session.id,
+          sessionId: session.session.id,
           result: {
             invocationId,
-            sessionId: env.session.id,
+            sessionId: session.session.id,
             toolName: 'Read',
             status: 'success',
             output: 'forged before claim',
@@ -3409,9 +3463,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
       lifecycle: { cleanupQueueOnClose: false, cleanupStateOnClose: false },
       submitTimeoutMs: 100,
     });
+    const session = await env.createSession();
 
     try {
-      const submit = env.submit({
+      const submit = session.submit({
         invocationId,
         toolName: 'Read',
         arguments: { path: 'missing.txt' },
@@ -3424,10 +3479,10 @@ describe('ExecutionerEnvironment file queue validation', () => {
         JSON.stringify({
           type: 'tool.invocation.completed',
           invocationId,
-          sessionId: env.session.id,
+          sessionId: session.session.id,
           result: {
             invocationId,
-            sessionId: env.session.id,
+            sessionId: session.session.id,
             toolName: 'Read',
             status: 'success',
             output: 'x'.repeat(10 * 1024 * 1024),
@@ -3457,7 +3512,7 @@ describe('workspace artifact materialization', () => {
     const root = await mkdtemp(join(tmpdir(), 'executioner-js-artifact-'));
     cleanup.push(root);
     const baseArtifact: WorkspaceArtifact = {
-      sessionId: 'sess_test',
+      environmentId: 'sess_test',
       artifact: { resourceType: 'artifact', uri: 'file:////tmp/workspace.tar' },
       manifest: { resourceType: 'artifact_manifest', uri: 'file:///unused' },
       format: 'tar',
@@ -3492,7 +3547,7 @@ describe('workspace artifact materialization', () => {
       { name: 'src/main.txt', kind: 'file', data: fileData },
     ]);
     const artifact: WorkspaceArtifact = {
-      sessionId: 'sess_test',
+      environmentId: 'sess_test',
       artifact: { resourceType: 'artifact', uri: `file://${tarPath}` },
       manifest: { resourceType: 'artifact_manifest', uri: 'file:///unused' },
       format: 'tar',
@@ -3538,7 +3593,7 @@ describe('workspace artifact materialization', () => {
     const fileData = Buffer.from('manifest order payload', 'utf8');
     const tarData = writeTar(tarPath, [{ name: 'file.txt', kind: 'file', data: fileData }]);
     const artifact: WorkspaceArtifact = {
-      sessionId: 'sess_test',
+      environmentId: 'sess_test',
       artifact: { resourceType: 'artifact', uri: `file://${tarPath}` },
       manifest: { resourceType: 'artifact_manifest', uri: `file://${manifestPath}` },
       format: 'tar',
@@ -3575,7 +3630,7 @@ describe('workspace artifact materialization', () => {
       format: artifact.format,
       manifest: artifact.manifest,
       artifact: artifact.artifact,
-      sessionId: artifact.sessionId,
+      environmentId: artifact.environmentId,
     }));
 
     await materializeWorkspaceArtifact(artifact, join(root, 'restored'));
@@ -3591,7 +3646,7 @@ describe('workspace artifact materialization', () => {
     const longName = `${'deep-name-'.repeat(11)}file.txt`;
     const tarData = writeTar(tarPath, [{ name: longName, kind: 'file', data: fileData }]);
     const artifact: WorkspaceArtifact = {
-      sessionId: 'sess_test',
+      environmentId: 'sess_test',
       artifact: { resourceType: 'artifact', uri: `file://${tarPath}` },
       manifest: { resourceType: 'artifact_manifest', uri: 'file:///unused' },
       format: 'tar',
@@ -3625,7 +3680,7 @@ describe('workspace artifact materialization', () => {
     const tarData = writeTar(tarPath, [{ name: 'file.txt', kind: 'file', data: fileData }]);
     const destinationParent = join(root, 'new-parent', 'nested');
     const artifact: WorkspaceArtifact = {
-      sessionId: 'sess_test',
+      environmentId: 'sess_test',
       artifact: { resourceType: 'artifact', uri: `file://${tarPath}` },
       manifest: { resourceType: 'artifact_manifest', uri: 'file:///unused' },
       format: 'zip',
@@ -3657,7 +3712,7 @@ describe('workspace artifact materialization', () => {
     const tarPath = join(root, 'workspace.tar');
     const tarData = writeTar(tarPath, []);
     const artifact: WorkspaceArtifact = {
-      sessionId: 'sess_test',
+      environmentId: 'sess_test',
       artifact: { resourceType: 'artifact', uri: `file://${tarPath}` },
       manifest: { resourceType: 'artifact_manifest', uri: 'file:///unused' },
       format: 'tar',
@@ -3687,7 +3742,7 @@ describe('workspace artifact materialization', () => {
     const tarData = writeTar(tarPath, []);
     const archivePath = Array.from({ length: 257 }, () => 'd').join('/');
     const artifact: WorkspaceArtifact = {
-      sessionId: 'sess_test',
+      environmentId: 'sess_test',
       artifact: { resourceType: 'artifact', uri: `file://${tarPath}` },
       manifest: { resourceType: 'artifact_manifest', uri: 'file:///unused' },
       format: 'tar',
@@ -3716,7 +3771,7 @@ describe('workspace artifact materialization', () => {
     const fileData = Buffer.from('safe', 'utf8');
     const tarData = writeTar(tarPath, [{ name: 'safe.txt', kind: 'file', data: fileData }]);
     const artifact: WorkspaceArtifact = {
-      sessionId: 'sess_test',
+      environmentId: 'sess_test',
       artifact: { resourceType: 'artifact', uri: `file://${tarPath}` },
       manifest: { resourceType: 'artifact_manifest', uri: 'file:///unused' },
       format: 'tar',
@@ -3751,7 +3806,7 @@ describe('workspace artifact materialization', () => {
     const tarData = writeTar(tarPath, [{ name: 'file.txt', kind: 'file', data: fileData }]);
     await symlink(tarPath, linkPath);
     const artifact: WorkspaceArtifact = {
-      sessionId: 'sess_test',
+      environmentId: 'sess_test',
       artifact: { resourceType: 'artifact', uri: `file://${linkPath}` },
       manifest: { resourceType: 'artifact_manifest', uri: 'file:///unused' },
       format: 'tar',
@@ -3783,7 +3838,7 @@ describe('workspace artifact materialization', () => {
     const fileData = Buffer.from('payload', 'utf8');
     const tarData = writeTar(tarPath, [{ name: 'file.txt', kind: 'file', data: fileData }]);
     const artifact: WorkspaceArtifact = {
-      sessionId: 'sess_test',
+      environmentId: 'sess_test',
       artifact: { resourceType: 'artifact', uri: `file://${tarPath}` },
       manifest: { resourceType: 'artifact_manifest', uri: `file://${manifestLink}` },
       format: 'tar',
@@ -3815,7 +3870,7 @@ describe('workspace artifact materialization', () => {
     const fileData = Buffer.from('payload', 'utf8');
     const tarData = writeTar(tarPath, [{ name: 'file.txt', kind: 'file', data: fileData }]);
     const artifact: WorkspaceArtifact = {
-      sessionId: 'sess_test',
+      environmentId: 'sess_test',
       artifact: { resourceType: 'artifact', uri: `file://${tarPath}` },
       manifest: { resourceType: 'artifact_manifest', uri: 'file:///unused' },
       format: 'tar',
@@ -3847,7 +3902,7 @@ describe('workspace artifact materialization', () => {
     const fileData = Buffer.from('payload', 'utf8');
     const tarData = writeTar(tarPath, [{ name: 'file.txt', kind: 'file', data: fileData }]);
     const artifact: WorkspaceArtifact = {
-      sessionId: 'sess_test',
+      environmentId: 'sess_test',
       artifact: { resourceType: 'artifact', uri: `file://${tarPath}` },
       manifest: { resourceType: 'artifact_manifest', uri: 'file:///unused' },
       format: 'tar',
@@ -3879,7 +3934,7 @@ describe('workspace artifact materialization', () => {
     const fileData = Buffer.from('payload', 'utf8');
     const tarData = writeTar(tarPath, [{ name: 'file.txt', kind: 'file', data: fileData }]);
     const artifact = {
-      sessionId: 'sess_test',
+      environmentId: 'sess_test',
       artifact: { resourceType: 'artifact', uri: `file://${tarPath}` },
       manifest: { resourceType: 'artifact_manifest', uri: 'file:///unused' },
       format: 'tar',
@@ -3911,7 +3966,7 @@ describe('workspace artifact materialization', () => {
     const fileData = Buffer.from('payload', 'utf8');
     const tarData = writeTar(tarPath, [{ name: 'file.txt', kind: 'file', data: fileData }]);
     const artifact = {
-      sessionId: 'sess_test',
+      environmentId: 'sess_test',
       artifact: { resourceType: 'artifact', uri: `file://${tarPath}` },
       manifest: { resourceType: 'artifact_manifest', uri: 'file:///unused' },
       format: 'tar',
@@ -3944,7 +3999,7 @@ describe('workspace artifact materialization', () => {
     const fileData = Buffer.from('payload', 'utf8');
     const tarData = writeTar(tarPath, [{ name: 'file.txt', kind: 'file', data: fileData }]);
     const artifactWithResourcePadding = {
-      sessionId: 'sess_test',
+      environmentId: 'sess_test',
       artifact: { resourceType: 'artifact', uri: `file://${tarPath}`, padding: 'unexpected' },
       manifest: { resourceType: 'artifact_manifest', uri: 'file:///unused' },
       format: 'tar',
@@ -3992,7 +4047,7 @@ describe('workspace artifact materialization', () => {
     const fileData = Buffer.from('payload', 'utf8');
     const tarData = writeTar(tarPath, [{ name: 'file.txt', kind: 'file', data: fileData }]);
     const artifact = {
-      sessionId: 'sess_test',
+      environmentId: 'sess_test',
       artifact: {
         resourceType: 'artifact',
         uri: `file://${tarPath}`,
@@ -4030,7 +4085,7 @@ describe('workspace artifact materialization', () => {
     const fileData = Buffer.from('payload', 'utf8');
     const tarData = writeTar(tarPath, [{ name: 'file.txt', kind: 'file', data: fileData }]);
     const artifact: WorkspaceArtifact = {
-      sessionId: 'sess_test',
+      environmentId: 'sess_test',
       artifact: { resourceType: 'artifact', uri: `file://${tarPath}` },
       manifest: { resourceType: 'artifact_manifest', uri: 'file:///unused' },
       format: 'tar',
@@ -4062,7 +4117,7 @@ describe('workspace artifact materialization', () => {
     const fileData = Buffer.from('payload', 'utf8');
     writeTar(tarPath, [{ name: 'file.txt', kind: 'file', data: fileData }]);
     const artifact: WorkspaceArtifact = {
-      sessionId: 'sess_test',
+      environmentId: 'sess_test',
       artifact: { resourceType: 'artifact', uri: `file://${tarPath}` },
       manifest: { resourceType: 'artifact_manifest', uri: 'file:///unused' },
       format: 'tar',
@@ -4095,7 +4150,7 @@ describe('workspace artifact materialization', () => {
     const fileData = Buffer.from('payload', 'utf8');
     const tarData = writeTar(tarPath, [{ name: 'file.txt', kind: 'file', data: fileData }]);
     const artifact: WorkspaceArtifact = {
-      sessionId: 'sess_test',
+      environmentId: 'sess_test',
       artifact: { resourceType: 'artifact', uri: `file://${tarPath}` },
       manifest: { resourceType: 'artifact_manifest', uri: `file://${manifestPath}` },
       format: 'tar',
@@ -4133,7 +4188,7 @@ describe('workspace artifact materialization', () => {
     tarData[148] = '7'.charCodeAt(0);
     writeFileSync(tarPath, tarData);
     const artifact: WorkspaceArtifact = {
-      sessionId: 'sess_test',
+      environmentId: 'sess_test',
       artifact: { resourceType: 'artifact', uri: `file://${tarPath}` },
       manifest: { resourceType: 'artifact_manifest', uri: 'file:///unused' },
       format: 'tar',
@@ -4166,7 +4221,7 @@ describe('workspace artifact materialization', () => {
     const tarData = writeTar(tarPath, [{ name: 'file.txt', kind: 'file', data: fileData }]).subarray(0, -1024);
     writeFileSync(tarPath, tarData);
     const artifact: WorkspaceArtifact = {
-      sessionId: 'sess_test',
+      environmentId: 'sess_test',
       artifact: { resourceType: 'artifact', uri: `file://${tarPath}` },
       manifest: { resourceType: 'artifact_manifest', uri: 'file:///unused' },
       format: 'tar',
@@ -4199,7 +4254,7 @@ describe('workspace artifact materialization', () => {
     const tarData = writeTar(tarPath, [{ name: 'file.txt', kind: 'file', data: fileData }]).subarray(0, -512);
     writeFileSync(tarPath, tarData);
     const artifact: WorkspaceArtifact = {
-      sessionId: 'sess_test',
+      environmentId: 'sess_test',
       artifact: { resourceType: 'artifact', uri: `file://${tarPath}` },
       manifest: { resourceType: 'artifact_manifest', uri: 'file:///unused' },
       format: 'tar',
@@ -4235,7 +4290,7 @@ describe('workspace artifact materialization', () => {
     ]);
     writeFileSync(tarPath, tarData);
     const artifact: WorkspaceArtifact = {
-      sessionId: 'sess_test',
+      environmentId: 'sess_test',
       artifact: { resourceType: 'artifact', uri: `file://${tarPath}` },
       manifest: { resourceType: 'artifact_manifest', uri: 'file:///unused' },
       format: 'tar',
@@ -4275,7 +4330,7 @@ describe('workspace artifact materialization', () => {
     ]);
     writeFileSync(tarPath, tarData);
     const artifact: WorkspaceArtifact = {
-      sessionId: 'sess_test',
+      environmentId: 'sess_test',
       artifact: { resourceType: 'artifact', uri: `file://${tarPath}` },
       manifest: { resourceType: 'artifact_manifest', uri: 'file:///unused' },
       format: 'tar',
@@ -4299,7 +4354,7 @@ describe('workspace artifact materialization', () => {
     const fileData = Buffer.from('payload', 'utf8');
     const tarData = writeTarRawName(tarPath, Buffer.from([0x62, 0x61, 0x64, 0x2d, 0xff, 0x2e, 0x74, 0x78, 0x74]), fileData);
     const artifact: WorkspaceArtifact = {
-      sessionId: 'sess_test',
+      environmentId: 'sess_test',
       artifact: { resourceType: 'artifact', uri: `file://${tarPath}` },
       manifest: { resourceType: 'artifact_manifest', uri: 'file:///unused' },
       format: 'tar',
@@ -4335,7 +4390,7 @@ describe('workspace artifact materialization', () => {
     await mkdir(outside);
     await symlink(outside, linkParent);
     const artifact: WorkspaceArtifact = {
-      sessionId: 'sess_test',
+      environmentId: 'sess_test',
       artifact: { resourceType: 'artifact', uri: `file://${tarPath}` },
       manifest: { resourceType: 'artifact_manifest', uri: 'file:///unused' },
       format: 'tar',
@@ -4371,7 +4426,7 @@ describe('workspace artifact materialization', () => {
     await mkdir(join(outside, 'existing'), { recursive: true });
     await symlink(outside, linkParent);
     const artifact: WorkspaceArtifact = {
-      sessionId: 'sess_test',
+      environmentId: 'sess_test',
       artifact: { resourceType: 'artifact', uri: `file://${tarPath}` },
       manifest: { resourceType: 'artifact_manifest', uri: 'file:///unused' },
       format: 'tar',
@@ -4408,7 +4463,7 @@ describe('workspace artifact materialization', () => {
       linkTarget: 'target.txt',
     }));
     const artifact: WorkspaceArtifact = {
-      sessionId: 'sess_test',
+      environmentId: 'sess_test',
       artifact: { resourceType: 'artifact', uri: `file://${tarPath}` },
       manifest: { resourceType: 'artifact_manifest', uri: 'file:///unused' },
       format: 'tar',

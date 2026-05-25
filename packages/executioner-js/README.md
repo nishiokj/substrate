@@ -13,27 +13,28 @@ install. For local managed execution, the SDK discovers a prebuilt `executioner`
 runtime from optional platform packages, a bundled `bin/executioner`, or
 `executioner` on `PATH`. Remote-host usage does not need a local runtime.
 
-The public API exposes a small environment facade:
+The public API separates environment lifetime from session lifetime:
 
 ```ts
-import { Environment } from '@substrate/sdk';
+import { ExecutionerEnvironment } from '@substrate/sdk';
 
-const env = await Environment.create({
-  workspace: 'new',
-  allowCommands: ['ls'],
+const env = await ExecutionerEnvironment.create({
+  workspace: { kind: 'new' },
+  policy: { process: { allowExec: true, allowedCommands: ['ls'] } },
 });
+const session = await env.createSession();
 
-await env.write('hello.txt', 'hello');
-console.log(await env.read('hello.txt'));
+await session.write('hello.txt', 'hello');
+console.log(await session.read('hello.txt'));
 
-const edit = await env.edit({
+const edit = await session.edit({
   path: 'hello.txt',
   oldString: 'hello',
   newString: 'hello from Substrate',
 });
 
-console.log(await env.bash('ls /workspace'));
-const files = await env.list();
+console.log(await session.bash('ls /workspace'));
+const files = await session.list();
 const artifact = await env.exportWorkspace();
 await env.materializeWorkspaceArtifact(artifact, '/tmp/restored-workspace');
 
@@ -45,15 +46,16 @@ matching tool-use blocks directly:
 
 ```ts
 import Anthropic from '@anthropic-ai/sdk';
-import { Environment } from '@substrate/sdk';
+import { ExecutionerEnvironment, toolSchemas } from '@substrate/sdk';
 
 const client = new Anthropic();
-const env = await Environment.create({
-  workspace: 'new',
-  allowCommands: ['python', 'pytest'],
+const env = await ExecutionerEnvironment.create({
+  workspace: { kind: 'new' },
+  policy: { process: { allowExec: true, allowedCommands: ['python', 'pytest'] } },
 });
+const session = await env.createSession();
 const messages = [{ role: 'user' as const, content: 'Create notes.txt and read it back.' }];
-const tools = env.toolSchemas().map((schema) => ({
+const tools = toolSchemas().map((schema) => ({
   name: schema.name,
   description: schema.description,
   input_schema: schema.inputSchema,
@@ -69,7 +71,7 @@ try {
 
   for (const block of response.content) {
     if (block.type === 'tool_use') {
-      const result = await env.execute(block);
+      const result = await session.execute(block);
       messages.push({
         role: 'user',
         content: [{
@@ -85,6 +87,6 @@ try {
 }
 ```
 
-The package hides the file-backed queue and worker transport behind the facade.
-`ExecutionerEnvironment.create(...)` remains available for advanced host,
-worker, and backend configuration.
+The package hides the file-backed queue and worker transport, but keeps
+environment and session lifecycles explicit. Multiple sessions can attach to the
+same environment.

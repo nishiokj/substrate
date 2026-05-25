@@ -159,7 +159,7 @@ pub fn export_workspace_excluding(
     let created_at = now_string();
 
     let artifact = WorkspaceArtifact {
-        session_id: session.id.clone(),
+        environment_id: session.id.clone(),
         artifact: ResourceRef {
             resource_type: "artifact".to_string(),
             uri: file_uri(&tar_path),

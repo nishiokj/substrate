@@ -1,7 +1,7 @@
 use executioner_core::{
-    CreateSessionRequest, ExecutionPolicy, HostState, NetworkPolicy, ProcessPolicy, ResourceRef,
-    ToolInvocationRequest, ToolResultStatus, WorkspaceArtifact, WorkspaceArtifactEntry,
-    WorkspaceMode, WorkspaceSpec,
+    CreateEnvironmentRequest, CreateSessionRequest, ExecutionPolicy, HostState, NetworkPolicy,
+    ProcessPolicy, ResourceRef, ToolInvocationRequest, ToolResultStatus, WorkspaceArtifact,
+    WorkspaceArtifactEntry, WorkspaceMode, WorkspaceSpec,
 };
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -37,8 +37,17 @@ fn create_session_with_policy(
     host: &HostState,
     policy: ExecutionPolicy,
 ) -> executioner_core::Session {
-    host.create_session(CreateSessionRequest {
-        session_id: Some("sess".to_string()),
+    create_session_with_policy_and_id(host, policy, "env", "sess")
+}
+
+fn create_session_with_policy_and_id(
+    host: &HostState,
+    policy: ExecutionPolicy,
+    environment_id: &str,
+    session_id: &str,
+) -> executioner_core::Session {
+    host.create_environment(CreateEnvironmentRequest {
+        environment_id: Some(environment_id.to_string()),
         workspace: WorkspaceSpec {
             mode: WorkspaceMode::New,
             root: None,
@@ -51,12 +60,22 @@ fn create_session_with_policy(
         metadata: Map::new(),
     })
     .unwrap()
+    .environment;
+    host.create_session(
+        environment_id,
+        CreateSessionRequest {
+            session_id: Some(session_id.to_string()),
+            policy: None,
+            metadata: Map::new(),
+        },
+    )
+    .unwrap()
     .session
 }
 
 fn create_existing_session(host: &HostState, root: &std::path::Path) -> executioner_core::Session {
-    host.create_session(CreateSessionRequest {
-        session_id: Some("sess_existing".to_string()),
+    host.create_environment(CreateEnvironmentRequest {
+        environment_id: Some("env_existing".to_string()),
         workspace: WorkspaceSpec {
             mode: WorkspaceMode::Existing,
             root: Some(root.to_string_lossy().into_owned()),
@@ -69,6 +88,16 @@ fn create_existing_session(host: &HostState, root: &std::path::Path) -> executio
         metadata: Map::new(),
     })
     .unwrap()
+    .environment;
+    host.create_session(
+        "env_existing",
+        CreateSessionRequest {
+            session_id: Some("sess_existing".to_string()),
+            policy: None,
+            metadata: Map::new(),
+        },
+    )
+    .unwrap()
     .session
 }
 
@@ -76,8 +105,8 @@ fn create_session_with_id(
     host: &HostState,
     session_id: &str,
 ) -> executioner_core::Result<executioner_core::CreateSessionResponse> {
-    host.create_session(CreateSessionRequest {
-        session_id: Some(session_id.to_string()),
+    host.create_environment(CreateEnvironmentRequest {
+        environment_id: Some(session_id.to_string()),
         workspace: WorkspaceSpec {
             mode: WorkspaceMode::New,
             root: None,
@@ -88,7 +117,15 @@ fn create_session_with_id(
         policy: policy(),
         ttl_ms: None,
         metadata: Map::new(),
-    })
+    })?;
+    host.create_session(
+        session_id,
+        CreateSessionRequest {
+            session_id: Some(session_id.to_string()),
+            policy: None,
+            metadata: Map::new(),
+        },
+    )
 }
 
 fn invoke(session_id: &str, tool_name: &str, arguments: Value) -> ToolInvocationRequest {
@@ -107,25 +144,147 @@ fn invoke(session_id: &str, tool_name: &str, arguments: Value) -> ToolInvocation
 }
 
 #[test]
-fn new_workspace_rejects_session_id_path_traversal() {
+fn multiple_sessions_can_share_one_environment_workspace() {
+    let temp = TempDir::new().unwrap();
+    let host = HostState::new(temp.path()).unwrap();
+    let environment = host
+        .create_environment(CreateEnvironmentRequest {
+            environment_id: Some("env_shared".to_string()),
+            workspace: WorkspaceSpec {
+                mode: WorkspaceMode::New,
+                root: None,
+                snapshot_ref: None,
+                template_ref: None,
+                mount_as_workspace: true,
+            },
+            policy: policy(),
+            ttl_ms: None,
+            metadata: Map::new(),
+        })
+        .unwrap()
+        .environment;
+
+    let session_a = host
+        .create_session(
+            &environment.id,
+            CreateSessionRequest {
+                session_id: Some("sess_a".to_string()),
+                policy: None,
+                metadata: Map::new(),
+            },
+        )
+        .unwrap()
+        .session;
+    let session_b = host
+        .create_session(
+            &environment.id,
+            CreateSessionRequest {
+                session_id: Some("sess_b".to_string()),
+                policy: None,
+                metadata: Map::new(),
+            },
+        )
+        .unwrap()
+        .session;
+
+    assert_eq!(session_a.workspace.root, environment.workspace.root);
+    assert_eq!(session_b.workspace.root, environment.workspace.root);
+
+    host.execute_invocation(invoke(
+        &session_a.id,
+        "Write",
+        json!({ "path": "shared.txt", "content": "hello" }),
+    ))
+    .unwrap();
+
+    let read = host
+        .execute_invocation(invoke(
+            &session_b.id,
+            "Read",
+            json!({ "path": "shared.txt" }),
+        ))
+        .unwrap();
+    assert_eq!(read.output, "hello");
+    assert_eq!(host.effects(&environment.id).unwrap().len(), 2);
+    assert_eq!(host.get_environment(&environment.id).unwrap().revision, 1);
+}
+
+#[test]
+fn closing_one_session_preserves_shared_environment_for_other_sessions() {
+    let temp = TempDir::new().unwrap();
+    let host = HostState::new(temp.path()).unwrap();
+    let environment = host
+        .create_environment(CreateEnvironmentRequest {
+            environment_id: Some("env_live".to_string()),
+            workspace: WorkspaceSpec {
+                mode: WorkspaceMode::New,
+                root: None,
+                snapshot_ref: None,
+                template_ref: None,
+                mount_as_workspace: true,
+            },
+            policy: policy(),
+            ttl_ms: None,
+            metadata: Map::new(),
+        })
+        .unwrap()
+        .environment;
+    let session_a = host
+        .create_session(
+            &environment.id,
+            CreateSessionRequest {
+                session_id: Some("sess_live_a".to_string()),
+                policy: None,
+                metadata: Map::new(),
+            },
+        )
+        .unwrap()
+        .session;
+    let session_b = host
+        .create_session(
+            &environment.id,
+            CreateSessionRequest {
+                session_id: Some("sess_live_b".to_string()),
+                policy: None,
+                metadata: Map::new(),
+            },
+        )
+        .unwrap()
+        .session;
+
+    host.close_session(&session_a.id).unwrap();
+    host.execute_invocation(invoke(
+        &session_b.id,
+        "Write",
+        json!({ "path": "still-live.txt", "content": "ok" }),
+    ))
+    .unwrap();
+
+    assert!(std::path::Path::new(&environment.workspace.root)
+        .join("still-live.txt")
+        .exists());
+}
+
+#[test]
+fn new_workspace_rejects_environment_id_path_traversal() {
     let temp = TempDir::new().unwrap();
     let state_dir = temp.path().join("state");
     let host = HostState::new(&state_dir).unwrap();
 
     let err = create_session_with_id(&host, "../escaped").unwrap_err();
 
-    assert!(err.to_string().contains("invalid session id"));
+    assert!(err.to_string().contains("invalid environment id"));
     assert!(!temp.path().join("escaped").exists());
 }
 
 #[test]
-fn new_workspace_rejects_session_id_with_path_separator() {
+fn new_workspace_rejects_environment_id_with_path_separator() {
     let temp = TempDir::new().unwrap();
     let host = HostState::new(temp.path().join("state")).unwrap();
 
     let err = create_session_with_id(&host, "nested/sess").unwrap_err();
 
-    assert!(err.to_string().contains("invalid session id"));
+    assert!(err.to_string().contains("invalid environment id"));
 }
 
 #[test]
@@ -180,7 +339,7 @@ fn host_state_rejects_symlink_state_ancestor_directory() {
 }
 
 #[test]
-fn new_workspace_rejects_preexisting_session_symlink_escape() {
+fn new_workspace_rejects_preexisting_environment_symlink_escape() {
     #[cfg(unix)]
     {
         let temp = TempDir::new().unwrap();
@@ -220,7 +379,7 @@ fn destroy_unlinks_swapped_managed_session_symlink_without_following_it() {
         fs::remove_dir_all(&session_dir).unwrap();
         std::os::unix::fs::symlink(&outside, &session_dir).unwrap();
 
-        host.destroy_session(&session.id).unwrap();
+        host.destroy_environment("sess_swapped_cleanup").unwrap();
 
         assert!(!session_dir.exists());
         assert_eq!(
@@ -242,8 +401,8 @@ fn existing_workspace_rejects_symlinked_parent_component() {
         std::os::unix::fs::symlink(&outside, &link_parent).unwrap();
 
         let err = host
-            .create_session(CreateSessionRequest {
-                session_id: Some("sess_symlink_parent".to_string()),
+            .create_environment(CreateEnvironmentRequest {
+                environment_id: Some("sess_symlink_parent".to_string()),
                 workspace: WorkspaceSpec {
                     mode: WorkspaceMode::Existing,
                     root: Some(link_parent.join("workspace").display().to_string()),
@@ -296,12 +455,12 @@ fn export_workspace_rejects_root_swapped_to_symlink_before_archiving() {
         fs::create_dir_all(&workspace).unwrap();
         fs::create_dir_all(&outside).unwrap();
         fs::write(outside.join("secret.txt"), "outside secret").unwrap();
-        let session = create_existing_session(&host, &workspace);
+        let _session = create_existing_session(&host, &workspace);
 
         fs::remove_dir_all(&workspace).unwrap();
         std::os::unix::fs::symlink(&outside, &workspace).unwrap();
 
-        let err = host.export_workspace(&session.id).unwrap_err();
+        let err = host.export_workspace("env_existing").unwrap_err();
 
         assert!(err.to_string().contains("workspace.root"));
     }
@@ -343,7 +502,7 @@ fn host_rejects_invalid_session_id_on_lifecycle_operations() {
         host.effects("../escaped").unwrap_err(),
         host.export_workspace("../escaped").unwrap_err(),
     ] {
-        assert!(err.to_string().contains("invalid session id"));
+        assert!(err.to_string().contains("invalid"));
     }
 }
 
@@ -376,7 +535,7 @@ fn host_rejects_invalid_invocation_id_without_running_tool() {
 }
 
 #[test]
-fn create_session_rejects_unenforceable_network_policy_without_workspace_side_effects() {
+fn create_environment_rejects_unenforceable_network_policy_without_workspace_side_effects() {
     let temp = TempDir::new().unwrap();
     let state_dir = temp.path().join("state");
     let host = HostState::new(&state_dir).unwrap();
@@ -384,8 +543,8 @@ fn create_session_rejects_unenforceable_network_policy_without_workspace_side_ef
     network_policy.network.enabled = true;
 
     let err = host
-        .create_session(CreateSessionRequest {
-            session_id: Some("network_enabled".to_string()),
+        .create_environment(CreateEnvironmentRequest {
+            environment_id: Some("network_enabled".to_string()),
             workspace: WorkspaceSpec {
                 mode: WorkspaceMode::New,
                 root: None,
@@ -407,8 +566,8 @@ fn create_session_rejects_unenforceable_network_policy_without_workspace_side_ef
     let mut host_list_policy = policy();
     host_list_policy.network.allow_hosts = vec!["example.com".to_string()];
     let err = host
-        .create_session(CreateSessionRequest {
-            session_id: Some("network_hosts".to_string()),
+        .create_environment(CreateEnvironmentRequest {
+            environment_id: Some("network_hosts".to_string()),
             workspace: WorkspaceSpec {
                 mode: WorkspaceMode::New,
                 root: None,
@@ -429,7 +588,7 @@ fn create_session_rejects_unenforceable_network_policy_without_workspace_side_ef
 }
 
 #[test]
-fn create_session_rejects_ignored_workspace_fields_without_workspace_side_effects() {
+fn create_environment_rejects_ignored_workspace_fields_without_workspace_side_effects() {
     let temp = TempDir::new().unwrap();
     let state_dir = temp.path().join("state");
     let host = HostState::new(&state_dir).unwrap();
@@ -481,8 +640,8 @@ fn create_session_rejects_ignored_workspace_fields_without_workspace_side_effect
         ),
     ] {
         let err = host
-            .create_session(CreateSessionRequest {
-                session_id: Some(session_id.to_string()),
+            .create_environment(CreateEnvironmentRequest {
+                environment_id: Some(session_id.to_string()),
                 workspace,
                 policy: policy(),
                 ttl_ms: None,
@@ -499,14 +658,14 @@ fn create_session_rejects_ignored_workspace_fields_without_workspace_side_effect
 }
 
 #[test]
-fn create_session_rejects_excessive_ttl_without_workspace_side_effects() {
+fn create_environment_rejects_excessive_ttl_without_workspace_side_effects() {
     let temp = TempDir::new().unwrap();
     let state_dir = temp.path().join("state");
     let host = HostState::new(&state_dir).unwrap();
 
     let err = host
-        .create_session(CreateSessionRequest {
-            session_id: Some("huge_ttl".to_string()),
+        .create_environment(CreateEnvironmentRequest {
+            environment_id: Some("huge_ttl".to_string()),
             workspace: WorkspaceSpec {
                 mode: WorkspaceMode::New,
                 root: None,
@@ -525,7 +684,7 @@ fn create_session_rejects_excessive_ttl_without_workspace_side_effects() {
 }
 
 #[test]
-fn create_session_rejects_excessive_output_limit_without_workspace_side_effects() {
+fn create_environment_rejects_excessive_output_limit_without_workspace_side_effects() {
     let temp = TempDir::new().unwrap();
     let state_dir = temp.path().join("state");
     let host = HostState::new(&state_dir).unwrap();
@@ -533,8 +692,8 @@ fn create_session_rejects_excessive_output_limit_without_workspace_side_effects(
     excessive_policy.max_output_bytes = Some(executioner_core::MAX_OUTPUT_BYTES + 1);
 
     let err = host
-        .create_session(CreateSessionRequest {
-            session_id: Some("huge_output".to_string()),
+        .create_environment(CreateEnvironmentRequest {
+            environment_id: Some("huge_output".to_string()),
             workspace: WorkspaceSpec {
                 mode: WorkspaceMode::New,
                 root: None,
@@ -553,7 +712,7 @@ fn create_session_rejects_excessive_output_limit_without_workspace_side_effects(
 }
 
 #[test]
-fn create_session_rejects_oversized_direct_request_without_workspace_side_effects() {
+fn create_environment_rejects_oversized_direct_request_without_workspace_side_effects() {
     let temp = TempDir::new().unwrap();
     let state_dir = temp.path().join("state");
     let host = HostState::new(&state_dir).unwrap();
@@ -561,8 +720,8 @@ fn create_session_rejects_oversized_direct_request_without_workspace_side_effect
     metadata.insert("padding".to_string(), json!("x".repeat(1024 * 1024)));
 
     let err = host
-        .create_session(CreateSessionRequest {
-            session_id: Some("huge_request".to_string()),
+        .create_environment(CreateEnvironmentRequest {
+            environment_id: Some("huge_request".to_string()),
             workspace: WorkspaceSpec {
                 mode: WorkspaceMode::New,
                 root: None,
@@ -581,7 +740,7 @@ fn create_session_rejects_oversized_direct_request_without_workspace_side_effect
 }
 
 #[test]
-fn create_session_rejects_excessive_duration_limit_without_workspace_side_effects() {
+fn create_environment_rejects_excessive_duration_limit_without_workspace_side_effects() {
     let temp = TempDir::new().unwrap();
     let state_dir = temp.path().join("state");
     let host = HostState::new(&state_dir).unwrap();
@@ -589,8 +748,8 @@ fn create_session_rejects_excessive_duration_limit_without_workspace_side_effect
     excessive_policy.max_duration_ms = Some(executioner_core::MAX_TOOL_TIMEOUT_MS + 1);
 
     let err = host
-        .create_session(CreateSessionRequest {
-            session_id: Some("huge_duration".to_string()),
+        .create_environment(CreateEnvironmentRequest {
+            environment_id: Some("huge_duration".to_string()),
             workspace: WorkspaceSpec {
                 mode: WorkspaceMode::New,
                 root: None,
@@ -609,7 +768,7 @@ fn create_session_rejects_excessive_duration_limit_without_workspace_side_effect
 }
 
 #[test]
-fn create_session_rejects_zero_duration_limit_without_workspace_side_effects() {
+fn create_environment_rejects_zero_duration_limit_without_workspace_side_effects() {
     let temp = TempDir::new().unwrap();
     let state_dir = temp.path().join("state");
     let host = HostState::new(&state_dir).unwrap();
@@ -617,8 +776,8 @@ fn create_session_rejects_zero_duration_limit_without_workspace_side_effects() {
     zero_policy.max_duration_ms = Some(0);
 
     let err = host
-        .create_session(CreateSessionRequest {
-            session_id: Some("zero_duration".to_string()),
+        .create_environment(CreateEnvironmentRequest {
+            environment_id: Some("zero_duration".to_string()),
             workspace: WorkspaceSpec {
                 mode: WorkspaceMode::New,
                 root: None,
@@ -810,8 +969,8 @@ fn empty_read_root_is_rejected_without_workspace_side_effects() {
     limited_policy.read_roots = vec!["".to_string()];
 
     let err = host
-        .create_session(CreateSessionRequest {
-            session_id: Some("invalid_read_root".to_string()),
+        .create_environment(CreateEnvironmentRequest {
+            environment_id: Some("invalid_read_root".to_string()),
             workspace: WorkspaceSpec {
                 mode: WorkspaceMode::New,
                 root: None,
@@ -838,8 +997,8 @@ fn empty_write_root_is_rejected_without_workspace_side_effects() {
     limited_policy.write_roots = vec!["".to_string()];
 
     let err = host
-        .create_session(CreateSessionRequest {
-            session_id: Some("invalid_write_root".to_string()),
+        .create_environment(CreateEnvironmentRequest {
+            environment_id: Some("invalid_write_root".to_string()),
             workspace: WorkspaceSpec {
                 mode: WorkspaceMode::New,
                 root: None,
@@ -873,8 +1032,8 @@ fn policy_root_traversal_is_rejected_without_workspace_side_effects() {
         limited_policy.read_roots = vec![root.to_string()];
 
         let err = host
-            .create_session(CreateSessionRequest {
-                session_id: Some(session_id.to_string()),
+            .create_environment(CreateEnvironmentRequest {
+                environment_id: Some(session_id.to_string()),
                 workspace: WorkspaceSpec {
                     mode: WorkspaceMode::New,
                     root: None,
@@ -1183,7 +1342,7 @@ fn read_rejects_excessive_max_bytes_without_reading() {
         .error
         .unwrap()
         .contains("maximum supported output size"));
-    assert!(host.effects(&session.id).unwrap().is_empty());
+    assert!(host.effects("env").unwrap().is_empty());
 }
 
 #[test]
@@ -1334,7 +1493,7 @@ fn destroy_removes_managed_workspace() {
     let session = create_session(&host);
     let root = session.workspace.root.clone();
 
-    host.destroy_session(&session.id).unwrap();
+    host.destroy_environment("env").unwrap();
 
     assert!(!std::path::Path::new(&root).exists());
 }
@@ -1345,9 +1504,9 @@ fn destroy_does_not_remove_existing_workspace() {
     let state = TempDir::new().unwrap();
     let host = HostState::new(state.path()).unwrap();
     fs::write(temp.path().join("kept.txt"), "kept").unwrap();
-    let session = create_existing_session(&host, temp.path());
+    let _session = create_existing_session(&host, temp.path());
 
-    host.destroy_session(&session.id).unwrap();
+    host.destroy_environment("env_existing").unwrap();
 
     assert!(temp.path().exists());
     assert_eq!(
@@ -1362,8 +1521,8 @@ fn existing_workspace_rejects_relative_root() {
     let host = HostState::new(state.path()).unwrap();
 
     let err = host
-        .create_session(CreateSessionRequest {
-            session_id: Some("sess_relative_existing".to_string()),
+        .create_environment(CreateEnvironmentRequest {
+            environment_id: Some("sess_relative_existing".to_string()),
             workspace: WorkspaceSpec {
                 mode: WorkspaceMode::Existing,
                 root: Some("relative-workspace".to_string()),
@@ -1393,8 +1552,8 @@ fn existing_workspace_rejects_symlink_root() {
     std::os::unix::fs::symlink(&real_workspace, &linked_workspace).unwrap();
 
     let err = host
-        .create_session(CreateSessionRequest {
-            session_id: Some("sess_linked_existing".to_string()),
+        .create_environment(CreateEnvironmentRequest {
+            environment_id: Some("sess_linked_existing".to_string()),
             workspace: WorkspaceSpec {
                 mode: WorkspaceMode::Existing,
                 root: Some(linked_workspace.to_string_lossy().into_owned()),
@@ -1418,9 +1577,9 @@ fn existing_workspace_rejects_symlink_root() {
 fn ttl_expiry_removes_managed_workspace_and_rejects_late_access() {
     let temp = TempDir::new().unwrap();
     let host = HostState::new(temp.path()).unwrap();
-    let session = host
-        .create_session(CreateSessionRequest {
-            session_id: Some("sess_ttl".to_string()),
+    let environment = host
+        .create_environment(CreateEnvironmentRequest {
+            environment_id: Some("env_ttl".to_string()),
             workspace: WorkspaceSpec {
                 mode: WorkspaceMode::New,
                 root: None,
@@ -1429,14 +1588,25 @@ fn ttl_expiry_removes_managed_workspace_and_rejects_late_access() {
                 mount_as_workspace: true,
             },
             policy: policy(),
-            ttl_ms: Some(1),
+            ttl_ms: Some(50),
             metadata: Map::new(),
         })
+        .unwrap()
+        .environment;
+    let session = host
+        .create_session(
+            &environment.id,
+            CreateSessionRequest {
+                session_id: Some("sess_ttl".to_string()),
+                policy: None,
+                metadata: Map::new(),
+            },
+        )
         .unwrap()
         .session;
     let root = session.workspace.root.clone();
 
-    std::thread::sleep(Duration::from_millis(5));
+    std::thread::sleep(Duration::from_millis(75));
 
     let err = host.get_session(&session.id).unwrap_err();
     assert!(err.to_string().contains("session not found"));
@@ -1452,9 +1622,9 @@ fn export_workspace_writes_tar_artifact_and_manifest() {
     fs::write(format!("{}/src/main.txt", session.workspace.root), "hello").unwrap();
     fs::write(format!("{}/README.md", session.workspace.root), "read me").unwrap();
 
-    let artifact = host.export_workspace(&session.id).unwrap();
+    let artifact = host.export_workspace("env").unwrap();
 
-    assert_eq!(artifact.session_id, session.id);
+    assert_eq!(artifact.environment_id, "env");
     assert_eq!(artifact.format, "tar");
     assert_eq!(artifact.file_count, 2);
     assert_eq!(artifact.directory_count, 1);
@@ -1714,9 +1884,9 @@ fn export_workspace_excludes_host_artifact_directory_inside_existing_workspace()
     fs::write(workspace.join("app.txt"), "app").unwrap();
     fs::write(state_dir.join("private-state.json"), "internal").unwrap();
     let host = HostState::new(&state_dir).unwrap();
-    let session = create_existing_session(&host, &workspace);
+    let _session = create_existing_session(&host, &workspace);
 
-    let artifact = host.export_workspace(&session.id).unwrap();
+    let artifact = host.export_workspace("env_existing").unwrap();
 
     assert!(artifact
         .entries
@@ -1749,13 +1919,13 @@ fn export_workspace_rejects_preexisting_state_session_symlink_for_existing_works
         fs::create_dir_all(&state_dir).unwrap();
         fs::create_dir_all(&outside).unwrap();
         fs::write(workspace.join("app.txt"), "app").unwrap();
-        std::os::unix::fs::symlink(&outside, state_dir.join("sess_existing")).unwrap();
+        std::os::unix::fs::symlink(&outside, state_dir.join("env_existing")).unwrap();
         let host = HostState::new(&state_dir).unwrap();
-        let session = create_existing_session(&host, &workspace);
+        let _session = create_existing_session(&host, &workspace);
 
-        let err = host.export_workspace(&session.id).unwrap_err();
+        let err = host.export_workspace("env_existing").unwrap_err();
 
-        assert!(err.to_string().contains("host state session directory"));
+        assert!(err.to_string().contains("host state environment directory"));
         assert!(!outside.join("artifacts").exists());
     }
 }
@@ -1771,7 +1941,7 @@ fn export_workspace_omits_unsafe_symlinks_without_following_them() {
         fs::write(&outside, "secret").unwrap();
         std::os::unix::fs::symlink(&outside, format!("{}/link", session.workspace.root)).unwrap();
 
-        let artifact = host.export_workspace(&session.id).unwrap();
+        let artifact = host.export_workspace("env").unwrap();
 
         assert_eq!(artifact.file_count, 0);
         assert_eq!(artifact.symlink_count, 0);
@@ -1801,7 +1971,7 @@ fn export_workspace_records_relative_symlink_target_without_archiving_contents()
         )
         .unwrap();
 
-        let artifact = host.export_workspace(&session.id).unwrap();
+        let artifact = host.export_workspace("env").unwrap();
         let manifest_path = artifact.manifest.uri.strip_prefix("file://").unwrap();
         let manifest: serde_json::Value =
             serde_json::from_slice(&fs::read(manifest_path).unwrap()).unwrap();
@@ -1841,7 +2011,7 @@ fn export_workspace_drops_backslash_symlink_target_instead_of_rewriting_it() {
         )
         .unwrap();
 
-        let artifact = host.export_workspace(&session.id).unwrap();
+        let artifact = host.export_workspace("env").unwrap();
 
         assert_eq!(artifact.symlink_count, 0);
         assert!(!artifact
@@ -1864,7 +2034,7 @@ fn export_workspace_rejects_backslash_file_paths_instead_of_rewriting_them() {
         )
         .unwrap();
 
-        let err = host.export_workspace(&session.id).unwrap_err();
+        let err = host.export_workspace("env").unwrap_err();
 
         assert!(err.to_string().contains("unsupported workspace path"));
     }
@@ -1882,7 +2052,7 @@ fn export_workspace_rejects_non_utf8_file_paths_instead_of_rewriting_them() {
     path.push(std::ffi::OsStr::from_bytes(b"bad-\xff.txt"));
     fs::write(path, "secret").unwrap();
 
-    let err = host.export_workspace(&session.id).unwrap_err();
+    let err = host.export_workspace("env").unwrap_err();
 
     assert!(err.to_string().contains("not valid UTF-8"));
 }
@@ -1902,7 +2072,7 @@ fn export_workspace_drops_relative_symlink_target_that_escapes_workspace() {
         )
         .unwrap();
 
-        let artifact = host.export_workspace(&session.id).unwrap();
+        let artifact = host.export_workspace("env").unwrap();
 
         assert_eq!(artifact.symlink_count, 0);
         assert!(!artifact
@@ -1925,7 +2095,7 @@ fn materialize_workspace_artifact_round_trips_export_with_unsafe_symlink() {
             format!("{}/unsafe-link", session.workspace.root),
         )
         .unwrap();
-        let artifact = host.export_workspace(&session.id).unwrap();
+        let artifact = host.export_workspace("env").unwrap();
         let destination = temp.path().join("restored-unsafe-symlink");
 
         executioner_core::artifact::materialize_workspace_artifact(&artifact, &destination)
@@ -1953,7 +2123,7 @@ fn materialize_workspace_artifact_restores_files_and_safe_symlinks() {
             format!("{}/main-link", session.workspace.root),
         )
         .unwrap();
-        let artifact = host.export_workspace(&session.id).unwrap();
+        let artifact = host.export_workspace("env").unwrap();
         let destination = temp.path().join("restored");
 
         executioner_core::artifact::materialize_workspace_artifact(&artifact, &destination)
@@ -1982,7 +2152,7 @@ fn materialize_workspace_artifact_rejects_symlink_artifact_resource() {
         std::os::unix::fs::symlink(&tar_path, &link_path).unwrap();
         let destination = temp.path().join("restore");
         let artifact = WorkspaceArtifact {
-            session_id: "sess".to_string(),
+            environment_id: "sess".to_string(),
             artifact: ResourceRef {
                 resource_type: "artifact".to_string(),
                 uri: format!("file://{}", link_path.to_string_lossy()),
@@ -2029,7 +2199,7 @@ fn materialize_workspace_artifact_rejects_symlink_manifest_resource() {
         let (hash, bytes) = test_hash_file(&tar_path);
         let destination = temp.path().join("restore");
         let artifact = WorkspaceArtifact {
-            session_id: "sess".to_string(),
+            environment_id: "sess".to_string(),
             artifact: ResourceRef {
                 resource_type: "artifact".to_string(),
                 uri: format!("file://{}", tar_path.to_string_lossy()),
@@ -2074,7 +2244,7 @@ fn materialize_workspace_artifact_rejects_symlinked_destination_parent() {
         let host = HostState::new(temp.path().join("state")).unwrap();
         let session = create_session(&host);
         fs::write(format!("{}/file.txt", session.workspace.root), "payload").unwrap();
-        let artifact = host.export_workspace(&session.id).unwrap();
+        let artifact = host.export_workspace("env").unwrap();
         let outside = temp.path().join("outside");
         let link_parent = temp.path().join("link-parent");
         fs::create_dir_all(&outside).unwrap();
@@ -2098,7 +2268,7 @@ fn materialize_workspace_artifact_rejects_symlinked_destination_ancestor() {
         let host = HostState::new(temp.path().join("state")).unwrap();
         let session = create_session(&host);
         fs::write(format!("{}/file.txt", session.workspace.root), "payload").unwrap();
-        let artifact = host.export_workspace(&session.id).unwrap();
+        let artifact = host.export_workspace("env").unwrap();
         let outside = temp.path().join("outside");
         let link_parent = temp.path().join("link-parent");
         fs::create_dir_all(outside.join("existing")).unwrap();
@@ -2122,7 +2292,7 @@ fn materialize_workspace_artifact_rejects_manifest_path_traversal() {
     let (hash, bytes) = test_hash_file(&tar_path);
     let destination = temp.path().join("restore");
     let artifact = WorkspaceArtifact {
-        session_id: "sess".to_string(),
+        environment_id: "sess".to_string(),
         artifact: ResourceRef {
             resource_type: "artifact".to_string(),
             uri: format!("file://{}", tar_path.to_string_lossy()),
@@ -2166,7 +2336,7 @@ fn materialize_workspace_artifact_does_not_leave_partial_files_on_failure() {
     let (hash, bytes) = test_hash_file(&tar_path);
     let destination = temp.path().join("restore");
     let artifact = WorkspaceArtifact {
-        session_id: "sess".to_string(),
+        environment_id: "sess".to_string(),
         artifact: ResourceRef {
             resource_type: "artifact".to_string(),
             uri: format!("file://{}", tar_path.to_string_lossy()),
@@ -2223,7 +2393,7 @@ fn materialize_workspace_artifact_rejects_manifest_file_with_missing_parent_dire
     let (hash, bytes) = test_hash_file(&tar_path);
     let destination = temp.path().join("restore");
     let artifact = WorkspaceArtifact {
-        session_id: "sess".to_string(),
+        environment_id: "sess".to_string(),
         artifact: ResourceRef {
             resource_type: "artifact".to_string(),
             uri: format!("file://{}", tar_path.to_string_lossy()),
@@ -2266,7 +2436,7 @@ fn materialize_workspace_artifact_rejects_inconsistent_manifest_counts() {
     let (hash, bytes) = test_hash_file(&tar_path);
     let destination = temp.path().join("restore");
     let artifact = WorkspaceArtifact {
-        session_id: "sess".to_string(),
+        environment_id: "sess".to_string(),
         artifact: ResourceRef {
             resource_type: "artifact".to_string(),
             uri: format!("file://{}", tar_path.to_string_lossy()),
@@ -2310,7 +2480,7 @@ fn materialize_workspace_artifact_rejects_wrong_format_before_extracting() {
     let (hash, bytes) = test_hash_file(&tar_path);
     let destination = temp.path().join("restore");
     let artifact = WorkspaceArtifact {
-        session_id: "sess".to_string(),
+        environment_id: "sess".to_string(),
         artifact: ResourceRef {
             resource_type: "artifact".to_string(),
             uri: format!("file://{}", tar_path.to_string_lossy()),
@@ -2357,7 +2527,7 @@ fn materialize_workspace_artifact_rejects_invalid_artifact_without_leaving_creat
     let destination_parent = temp.path().join("new-parent").join("nested");
     let destination = destination_parent.join("restore");
     let artifact = WorkspaceArtifact {
-        session_id: "sess".to_string(),
+        environment_id: "sess".to_string(),
         artifact: ResourceRef {
             resource_type: "artifact".to_string(),
             uri: format!("file://{}", tar_path.to_string_lossy()),
@@ -2402,7 +2572,7 @@ fn materialize_workspace_artifact_rejects_logical_archive_path_mismatch() {
     let (hash, bytes) = test_hash_file(&tar_path);
     let destination = temp.path().join("restore");
     let artifact = WorkspaceArtifact {
-        session_id: "sess".to_string(),
+        environment_id: "sess".to_string(),
         artifact: ResourceRef {
             resource_type: "artifact".to_string(),
             uri: format!("file://{}", tar_path.to_string_lossy()),
@@ -2446,7 +2616,7 @@ fn materialize_workspace_artifact_rejects_backslash_archive_paths() {
     let (hash, bytes) = test_hash_file(&tar_path);
     let destination = temp.path().join("restore");
     let artifact = WorkspaceArtifact {
-        session_id: "sess".to_string(),
+        environment_id: "sess".to_string(),
         artifact: ResourceRef {
             resource_type: "artifact".to_string(),
             uri: format!("file://{}", tar_path.to_string_lossy()),
@@ -2501,7 +2671,7 @@ fn materialize_workspace_artifact_rejects_stale_manifest_resource() {
     let (hash, bytes) = test_hash_file(&tar_path);
     let destination = temp.path().join("restore");
     let artifact = WorkspaceArtifact {
-        session_id: "sess".to_string(),
+        environment_id: "sess".to_string(),
         artifact: ResourceRef {
             resource_type: "artifact".to_string(),
             uri: format!("file://{}", tar_path.to_string_lossy()),
@@ -2552,7 +2722,7 @@ fn materialize_workspace_artifact_rejects_oversized_manifest_resource() {
     let (hash, bytes) = test_hash_file(&tar_path);
     let destination = temp.path().join("restore");
     let artifact = WorkspaceArtifact {
-        session_id: "sess".to_string(),
+        environment_id: "sess".to_string(),
         artifact: ResourceRef {
             resource_type: "artifact".to_string(),
             uri: format!("file://{}", tar_path.to_string_lossy()),
@@ -2599,7 +2769,7 @@ fn materialize_workspace_artifact_rejects_oversized_declared_artifact_before_rea
     let (_hash, _bytes) = test_hash_file(&tar_path);
     let destination = temp.path().join("restore");
     let artifact = WorkspaceArtifact {
-        session_id: "sess".to_string(),
+        environment_id: "sess".to_string(),
         artifact: ResourceRef {
             resource_type: "artifact".to_string(),
             uri: format!("file://{}", tar_path.to_string_lossy()),
@@ -2643,7 +2813,7 @@ fn materialize_workspace_artifact_rejects_oversized_manifest_file_entry_before_e
     let (tar_hash, tar_bytes) = test_hash_file(&tar_path);
     let destination = temp.path().join("restore");
     let artifact = WorkspaceArtifact {
-        session_id: "sess_test".to_string(),
+        environment_id: "sess_test".to_string(),
         artifact: ResourceRef {
             resource_type: "artifact".to_string(),
             uri: format!("file://{}", tar_path.to_string_lossy()),
@@ -2685,7 +2855,7 @@ fn materialize_workspace_artifact_rejects_excessive_manifest_path_depth() {
     let archive_path = std::iter::repeat_n("d", 257).collect::<Vec<_>>().join("/");
     let destination = temp.path().join("restore");
     let artifact = WorkspaceArtifact {
-        session_id: "sess_test".to_string(),
+        environment_id: "sess_test".to_string(),
         artifact: ResourceRef {
             resource_type: "artifact".to_string(),
             uri: format!("file://{}", tar_path.to_string_lossy()),
@@ -2728,7 +2898,7 @@ fn materialize_workspace_artifact_rejects_oversized_actual_artifact_before_hashi
         .unwrap();
     let destination = temp.path().join("restore");
     let artifact = WorkspaceArtifact {
-        session_id: "sess_test".to_string(),
+        environment_id: "sess_test".to_string(),
         artifact: ResourceRef {
             resource_type: "artifact".to_string(),
             uri: format!("file://{}", tar_path.to_string_lossy()),
@@ -2762,7 +2932,7 @@ fn materialize_workspace_artifact_rejects_relative_file_manifest_uri() {
     let (tar_hash, tar_bytes) = test_hash_file(&tar_path);
     let destination = temp.path().join("restore");
     let artifact = WorkspaceArtifact {
-        session_id: "sess_test".to_string(),
+        environment_id: "sess_test".to_string(),
         artifact: ResourceRef {
             resource_type: "artifact".to_string(),
             uri: format!("file://{}", tar_path.to_string_lossy()),
@@ -2805,7 +2975,7 @@ fn materialize_workspace_artifact_rejects_unsupported_manifest_uri_scheme() {
     let (tar_hash, tar_bytes) = test_hash_file(&tar_path);
     let destination = temp.path().join("restore");
     let artifact = WorkspaceArtifact {
-        session_id: "sess_test".to_string(),
+        environment_id: "sess_test".to_string(),
         artifact: ResourceRef {
             resource_type: "artifact".to_string(),
             uri: format!("file://{}", tar_path.to_string_lossy()),
@@ -2846,7 +3016,7 @@ fn materialize_workspace_artifact_rejects_symlink_entry_without_target() {
     let (tar_hash, tar_bytes) = test_hash_file(&tar_path);
     let destination = temp.path().join("restore");
     let artifact = WorkspaceArtifact {
-        session_id: "sess_test".to_string(),
+        environment_id: "sess_test".to_string(),
         artifact: ResourceRef {
             resource_type: "artifact".to_string(),
             uri: format!("file://{}", tar_path.to_string_lossy()),
@@ -2889,7 +3059,7 @@ fn materialize_workspace_artifact_rejects_nul_manifest_archive_path() {
     let (tar_hash, tar_bytes) = test_hash_file(&tar_path);
     let destination = temp.path().join("restore");
     let artifact = WorkspaceArtifact {
-        session_id: "sess_test".to_string(),
+        environment_id: "sess_test".to_string(),
         artifact: ResourceRef {
             resource_type: "artifact".to_string(),
             uri: format!("file://{}", tar_path.to_string_lossy()),
@@ -2932,7 +3102,7 @@ fn materialize_workspace_artifact_rejects_non_utf8_archive_paths_instead_of_rewr
         let (tar_hash, tar_bytes) = test_hash_file(&tar_path);
         let destination = temp.path().join("restore");
         let artifact = WorkspaceArtifact {
-            session_id: "sess_test".to_string(),
+            environment_id: "sess_test".to_string(),
             artifact: ResourceRef {
                 resource_type: "artifact".to_string(),
                 uri: format!("file://{}", tar_path.to_string_lossy()),
@@ -2978,7 +3148,7 @@ fn materialize_workspace_artifact_rejects_tar_missing_end_of_archive_marker() {
     fs::write(&tar_path, &tar_bytes).unwrap();
     let destination = temp.path().join("restore");
     let artifact = WorkspaceArtifact {
-        session_id: "sess_test".to_string(),
+        environment_id: "sess_test".to_string(),
         artifact: ResourceRef {
             resource_type: "artifact".to_string(),
             uri: format!("file://{}", tar_path.to_string_lossy()),
@@ -3023,7 +3193,7 @@ fn materialize_workspace_artifact_rejects_tar_trailing_data_after_end_of_archive
     fs::write(&tar_path, &tar_bytes).unwrap();
     let destination = temp.path().join("restore");
     let artifact = WorkspaceArtifact {
-        session_id: "sess_test".to_string(),
+        environment_id: "sess_test".to_string(),
         artifact: ResourceRef {
             resource_type: "artifact".to_string(),
             uri: format!("file://{}", tar_path.to_string_lossy()),
@@ -3064,7 +3234,7 @@ fn materialize_workspace_artifact_rejects_nul_manifest_symlink_target() {
     let (tar_hash, tar_bytes) = test_hash_file(&tar_path);
     let destination = temp.path().join("restore");
     let artifact = WorkspaceArtifact {
-        session_id: "sess_test".to_string(),
+        environment_id: "sess_test".to_string(),
         artifact: ResourceRef {
             resource_type: "artifact".to_string(),
             uri: format!("file://{}", tar_path.to_string_lossy()),
@@ -3105,7 +3275,7 @@ fn materialize_workspace_artifact_rejects_backslash_manifest_symlink_target() {
     let (tar_hash, tar_bytes) = test_hash_file(&tar_path);
     let destination = temp.path().join("restore");
     let artifact = WorkspaceArtifact {
-        session_id: "sess_test".to_string(),
+        environment_id: "sess_test".to_string(),
         artifact: ResourceRef {
             resource_type: "artifact".to_string(),
             uri: format!("file://{}", tar_path.to_string_lossy()),
@@ -3146,7 +3316,7 @@ fn materialize_workspace_artifact_rejects_manifest_directory_missing_from_artifa
     let (tar_hash, tar_bytes) = test_hash_file(&tar_path);
     let destination = temp.path().join("restore");
     let artifact = WorkspaceArtifact {
-        session_id: "sess_test".to_string(),
+        environment_id: "sess_test".to_string(),
         artifact: ResourceRef {
             resource_type: "artifact".to_string(),
             uri: format!("file://{}", tar_path.to_string_lossy()),
@@ -3200,7 +3370,7 @@ fn materialize_workspace_artifact_rejects_excessive_manifest_entries() {
             })
             .collect::<Vec<_>>();
         let artifact = WorkspaceArtifact {
-            session_id: "sess_test".to_string(),
+            environment_id: "sess_test".to_string(),
             artifact: ResourceRef {
                 resource_type: "artifact".to_string(),
                 uri: format!("file://{}", tar_path.to_string_lossy()),
