@@ -13,9 +13,12 @@ SDKs resolve the runtime binary in this order:
 
 1. The explicit `binaryPath` / `binary_path` option.
 2. The `EXECUTIONER_BIN` environment variable.
-3. A `bin/executioner` file bundled inside the installed SDK package.
+3. A private/dev `bin/executioner` file inside the installed SDK package.
 4. A platform sidecar runtime package, if one is installed.
 5. `executioner` on `PATH`.
+
+Public registry SDK artifacts should not ship the private/dev bundled binary.
+Registry publishing keeps the SDK and runtime packages separate.
 
 Remote-host usage does not require a local runtime binary:
 
@@ -48,11 +51,18 @@ await Environment.create({ workspace: { kind: 'new' } });
 Publish the SDK packages without a Rust build step:
 
 - npm: `@substrate/sdk`
-- PyPI: `substrate`
+- PyPI: `substrate-sdk`
 
-For npm, publish platform sidecar runtime packages. `@substrate/sdk` lists them
-as optional dependencies, and each sidecar package should declare its `os` and
-`cpu` fields so package managers install only the matching runtime:
+The Python distribution name is `substrate-sdk`, while the import surface stays
+`substrate`:
+
+```py
+from substrate import Environment
+```
+
+For npm, publish platform sidecar runtime packages. Each sidecar package should
+declare its `os` and `cpu` fields so package managers install only the matching
+runtime:
 
 - npm: `@substrate/executioner-darwin-arm64`,
   `@substrate/executioner-darwin-x64`, `@substrate/executioner-linux-arm64`,
@@ -61,15 +71,47 @@ as optional dependencies, and each sidecar package should declare its `os` and
 Each sidecar package should contain the prebuilt binary at `bin/executioner`
 or `bin/executioner.exe`.
 
-For Python, keep `substrate` pure by default. There are two supported local
-runtime paths:
+The SDK resolver will use a sidecar package if it is installed. Do not add these
+packages to `@substrate/sdk` as `optionalDependencies` until every referenced
+sidecar has been published and a real install of the packed SDK succeeds without
+network stalls or resolution warnings.
 
-- Publish platform-specific `substrate` wheels that include
-  `executioner_sdk/bin/executioner`. The included `setup.py` marks those wheels
-  as platform-specific when that directory exists.
-- Publish a `substrate-runtime` package exposing
-  `substrate_runtime/bin/executioner`, then install local mode with
-  `pip install "substrate[local]"`.
+For Python, keep the SDK wheel pure (`py3-none-any`) and publish a separate
+`substrate-runtime` distribution with platform-specific wheels exposing
+`substrate_runtime/bin/executioner`. Until that runtime distribution exists,
+users should provide `binary_path`, `EXECUTIONER_BIN`, or an `executioner` on
+`PATH` for local managed mode.
+
+Once `substrate-runtime` is published, the SDK may add an optional dependency
+extra such as:
+
+```sh
+pip install "substrate-sdk[local]"
+```
+
+or install the runtime package directly alongside the SDK.
 
 Both approaches keep Rust out of SDK installation: users receive a prebuilt
 binary, not a local compile.
+
+## Validation
+
+Before publishing a release, validate the artifacts themselves:
+
+```sh
+cd packages/executioner-js
+bun run build
+npm --cache .npm-cache pack --dry-run --json
+```
+
+The npm dry run should list only `README.md`, `package.json`, `dist/index.js`,
+and `src/index.ts` for the SDK package.
+
+```sh
+cd packages/executioner-python
+python3 -m build
+python3 -m twine check dist/*
+```
+
+The Python SDK wheel should be tagged `py3-none-any` and should not contain an
+`executioner` binary.

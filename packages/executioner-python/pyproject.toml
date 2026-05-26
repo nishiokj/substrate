@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "substrate"
+name = "substrate-sdk"
 version = "0.1.0"
 description = "Python SDK for the Substrate agent execution environment"
 readme = "README.md"
@@ -11,7 +11,7 @@ requires-python = ">=3.9"
 authors = [
   { name = "Substrate" },
 ]
-license = { text = "MIT" }
+license = "MIT"
 keywords = ["agents", "sandbox", "tools", "substrate"]
 classifiers = [
   "Programming Language :: Python :: 3",
@@ -21,14 +21,5 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
 ]
 
-[project.optional-dependencies]
-local = ["substrate-runtime==0.1.0"]
-
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.setuptools.package-data]
-executioner_sdk = [
-  "bin/executioner",
-  "bin/executioner.exe",
-]

@@ -5,6 +5,10 @@
   "type": "module",
   "main": "./dist/index.js",
   "types": "./src/index.ts",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "exports": {
     ".": {
       "import": "./dist/index.js",
@@ -12,19 +16,11 @@
     }
   },
   "files": [
-    "bin",
     "dist",
     "src",
     "package.json",
     "README.md"
   ],
-  "optionalDependencies": {
-    "@substrate/executioner-darwin-arm64": "0.1.0",
-    "@substrate/executioner-darwin-x64": "0.1.0",
-    "@substrate/executioner-linux-arm64": "0.1.0",
-    "@substrate/executioner-linux-x64": "0.1.0",
-    "@substrate/executioner-win32-x64": "0.1.0"
-  },
   "scripts": {
     "build": "bun build ./src/index.ts --target=node --outdir=./dist",
     "test": "bun test",

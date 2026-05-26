@@ -10,7 +10,7 @@ npm install @substrate/sdk
 
 The package is pure TypeScript/JavaScript. It does not compile Rust during
 install. For local managed execution, the SDK discovers a prebuilt `executioner`
-runtime from optional platform packages, a bundled `bin/executioner`, or
+runtime from installed platform packages, `EXECUTIONER_BIN` / `binaryPath`, or
 `executioner` on `PATH`. Remote-host usage does not need a local runtime.
 
 The public API separates environment lifetime from session lifetime:
