@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "substrate-runtime"
+version = "0.1.1"
+description = "Prebuilt Substrate runtime binary"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+  { name = "Substrate" },
+]
+license = "MIT"
+keywords = ["agents", "sandbox", "tools", "substrate"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+substrate_runtime = [
+  "bin/substrate-runtime",
+  "bin/substrate-runtime.exe",
+]

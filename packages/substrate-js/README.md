@@ -1,0 +1,108 @@
+# @substrate/sdk
+
+TypeScript SDK for the Substrate agent execution environment.
+
+Install:
+
+```sh
+npm install @substrate/sdk
+```
+
+The package is pure TypeScript/JavaScript. It does not compile Rust during
+install. For local managed execution, the SDK discovers a prebuilt `substrate-runtime`
+runtime from installed platform packages, `SUBSTRATE_RUNTIME_BIN` / `binaryPath`, or
+`substrate-runtime` on `PATH`. Remote-host usage does not need a local runtime.
+
+The public API separates environment lifetime from session lifetime:
+
+```ts
+import { Environment } from '@substrate/sdk';
+
+const env = await Environment.create({
+  workspace: { kind: 'new' },
+  policy: { process: { allowExec: true, allowedCommands: ['ls'] } },
+});
+const session = await env.createSession();
+
+await session.write('hello.txt', 'hello');
+console.log(await session.read('hello.txt'));
+
+const edit = await session.edit({
+  path: 'hello.txt',
+  oldString: 'hello',
+  newString: 'hello from Substrate',
+});
+
+console.log(await session.bash('ls /workspace'));
+const files = await session.list();
+const artifact = await env.exportWorkspace();
+await env.materializeWorkspaceArtifact(artifact, '/tmp/restored-workspace');
+
+await env.close();
+```
+
+To join an environment created by another process or client, attach to it. An
+attached handle can create sessions and submit tool calls, but it does not close
+or destroy the environment when the handle is closed:
+
+```ts
+const env = await Environment.attach({
+  host: { kind: 'http', baseUrl: 'http://127.0.0.1:8765/' },
+  environmentId: 'env_shared',
+});
+
+const session = await env.createSession();
+await session.write('client-a.txt', 'hello');
+await env.close();
+```
+
+For an agent loop, pass Substrate's schemas into the model request, then execute
+matching tool-use blocks directly:
+
+```ts
+import Anthropic from '@anthropic-ai/sdk';
+import { Environment, toolSchemas } from '@substrate/sdk';
+
+const client = new Anthropic();
+const env = await Environment.create({
+  workspace: { kind: 'new' },
+  policy: { process: { allowExec: true, allowedCommands: ['python', 'pytest'] } },
+});
+const session = await env.createSession();
+const messages = [{ role: 'user' as const, content: 'Create notes.txt and read it back.' }];
+const tools = toolSchemas().map((schema) => ({
+  name: schema.name,
+  description: schema.description,
+  input_schema: schema.inputSchema,
+}));
+
+try {
+  const response = await client.messages.create({
+    model: '...',
+    max_tokens: 1024,
+    tools,
+    messages,
+  });
+
+  for (const block of response.content) {
+    if (block.type === 'tool_use') {
+      const result = await session.execute(block);
+      messages.push({
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: block.id,
+          content: result.output,
+        }],
+      });
+    }
+  }
+} finally {
+  await env.close();
+}
+```
+
+The package hides the file-backed queue and worker transport, but keeps
+environment and session lifecycles explicit. Multiple sessions can attach to the
+same environment. The host serializes tool execution per environment so those
+sessions share one mutable workspace through an ordered stream.

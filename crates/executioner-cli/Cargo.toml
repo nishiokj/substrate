@@ -1,11 +1,11 @@
 [package]
-name = "executioner"
-version = "0.1.0"
+name = "substrate-runtime"
+version = "0.1.1"
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "executioner"
+name = "substrate-runtime"
 path = "src/main.rs"
 
 [dependencies]

@@ -1,4 +1,10 @@
 # Substrate
+[![PyPI](https://img.shields.io/pypi/v/substrate-sdk?style=flat-square)]
+  (https://pypi.org/project/substrate-sdk/)
+  [![License](https://img.shields.io/github/license/nishiokj/substrate?
+  style=flat-square)](https://github.com/nishiokj/substrate/blob/main/
+  LICENSE)
+
 
 Substrate is a standalone Rust tool execution layer for agent applications.
 
@@ -13,17 +19,17 @@ The agent adapter is a consumer of this protocol, not the owner of it.
 
 ## Workspace
 
-- `crates/executioner-core`: protocol types, environment/session lifecycle,
+- `crates/runtime-core`: protocol types, environment/session lifecycle,
   workspace path resolution, effect ledger, and the built-in tool
   implementations.
-- `crates/executioner-host`: HTTP host server over `executioner-core`.
-- `crates/executioner-worker`: broker/host abstractions, reusable file-backed
+- `crates/runtime-host`: HTTP host server over `substrate-runtime-core`.
+- `crates/runtime-worker`: broker/host abstractions, reusable file-backed
   broker, and pull worker loops.
-- `crates/executioner-cli`: CLI for starting a host, calling a host, and running
+- `crates/runtime-cli`: CLI for starting a host, calling a host, and running
   a file-backed worker once.
-- `packages/executioner-js`: TypeScript SDK that manages environment, session,
+- `packages/substrate-js`: TypeScript SDK that manages environment, session,
   worker, and file-backed queue lifecycle.
-- `packages/executioner-python`: Python SDK that manages environment, session,
+- `packages/substrate-python`: Python SDK that manages environment, session,
   worker, and file-backed queue lifecycle.
 - `docs/`: architecture and lifecycle notes.
 - `examples/`: minimal SDK and agent-loop samples, plus JSON requests for
@@ -73,8 +79,8 @@ pip install substrate-sdk
 ```
 
 The SDKs are pure TypeScript/Python packages. Local managed mode starts a
-prebuilt `executioner` runtime binary discovered from an explicit binary path,
-installed runtime sidecar packages, or `executioner` on `PATH`. Remote-host mode
+prebuilt `substrate-runtime` binary discovered from an explicit binary path,
+installed runtime packages, or `substrate-runtime` on `PATH`. Remote-host mode
 does not need a local runtime binary.
 
 Minimal SDK usage:
@@ -153,7 +159,7 @@ cargo test
 Start a host:
 
 ```sh
-cargo run -p executioner -- host --addr 127.0.0.1:8765 --state-dir /tmp/executioner
+cargo run -p substrate-runtime -- host --addr 127.0.0.1:8765 --state-dir /tmp/substrate-runtime
 ```
 
 Create an environment over HTTP:
@@ -187,7 +193,7 @@ workspace export, attach, and explicit environment destruction.
 Create a session attached to that environment:
 
 ```sh
-cargo run -p executioner -- session create \
+cargo run -p substrate-runtime -- session create \
   --host-url http://127.0.0.1:8765 \
   --environment-id env_...
 ```
@@ -195,7 +201,7 @@ cargo run -p executioner -- session create \
 Invoke a write:
 
 ```sh
-cargo run -p executioner -- invoke \
+cargo run -p substrate-runtime -- invoke \
   --host-url http://127.0.0.1:8765 \
   --session-id sess_... \
   --tool Write \
@@ -206,7 +212,7 @@ Export the environment workspace to an artifact. Artifacts belong to the
 environment, so this command takes `--environment-id`:
 
 ```sh
-cargo run -p executioner -- session export \
+cargo run -p substrate-runtime -- session export \
   --host-url http://127.0.0.1:8765 \
   --environment-id env_...
 ```
@@ -222,17 +228,17 @@ aliases. These helpers delegate to the built-in `List` tool.
 Run a worker daemon against a file-backed queue and a remote or local host:
 
 ```sh
-cargo run -p executioner -- worker run \
+cargo run -p substrate-runtime -- worker run \
   --host-url http://127.0.0.1:8765 \
-  --queue-dir /tmp/executioner-queue
+  --queue-dir /tmp/runtime-queue
 ```
 
 Process one queued item and exit:
 
 ```sh
-cargo run -p executioner -- worker run-once \
+cargo run -p substrate-runtime -- worker run-once \
   --host-url http://127.0.0.1:8765 \
-  --queue-dir /tmp/executioner-queue
+  --queue-dir /tmp/runtime-queue
 ```
 
 ## Documents

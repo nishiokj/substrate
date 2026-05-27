@@ -1,0 +1,32 @@
+{
+  "name": "@substrate/sdk",
+  "version": "0.1.1",
+  "description": "TypeScript SDK for the Substrate agent execution environment",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./src/index.ts",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./src/index.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "package.json",
+    "README.md"
+  ],
+  "optionalDependencies": {
+    "@substrate/runtime-darwin-arm64": "0.1.1"
+  },
+  "scripts": {
+    "build": "bun build ./src/index.ts --target=node --outdir=./dist",
+    "test": "bun test",
+    "clean": "rm -rf dist"
+  }
+}

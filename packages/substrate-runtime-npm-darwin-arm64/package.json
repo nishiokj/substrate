@@ -1,0 +1,20 @@
+{
+  "name": "@substrate/runtime-darwin-arm64",
+  "version": "0.1.1",
+  "description": "Substrate runtime binary for macOS arm64",
+  "license": "MIT",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "bin",
+    "package.json",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

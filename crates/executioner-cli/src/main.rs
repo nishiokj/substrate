@@ -15,7 +15,7 @@ const MAX_HTTP_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_HTTP_JSON_BODY_BYTES: usize = 10 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
-#[command(name = "executioner")]
+#[command(name = "substrate-runtime")]
 #[command(about = "Standalone agent tool execution substrate")]
 struct Cli {
     #[command(subcommand)]
