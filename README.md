@@ -1,7 +1,7 @@
 # Substrate
-[![PyPI](https://img.shields.io/pypi/v/substrate-sdk?style=flat-square)]
-(https://pypi.org/project/substrate-sdk/)
-[![License](https://img.shields.io/github/license/nishiokj/substrate?style=flat-square)](https://github.com/nishiokj/substrate/blob/main/LICENSE)
+
+[![PyPI](https://img.shields.io/pypi/v/substrate-sdk?style=flat-square)](https://pypi.org/project/substrate-sdk/)
+[![License](https://img.shields.io/github/license/nishiokj/substrate?style=flat-square)](LICENSE)
 
 
 Substrate is a standalone Rust tool execution layer for agent applications.
