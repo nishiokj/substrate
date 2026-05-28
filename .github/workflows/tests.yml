@@ -32,11 +32,17 @@ jobs:
       - name: Run Rust tests
         run: cargo test --workspace
 
+      - name: Build runtime binary
+        run: cargo build --bin substrate-runtime
+
       - name: Run Python tests
         run: python -m unittest discover -s packages/substrate-python/tests
         env:
           PYTHONPATH: packages/substrate-python/src
+          SUBSTRATE_RUNTIME_BIN: ${{ github.workspace }}/target/debug/substrate-runtime
 
       - name: Run TypeScript tests
         run: bun test
         working-directory: packages/substrate-js
+        env:
+          SUBSTRATE_RUNTIME_BIN: ${{ github.workspace }}/target/debug/substrate-runtime
