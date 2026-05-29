@@ -163,6 +163,7 @@ export type SubmitResult = {
 
 export type SessionInfo = {
   id: string;
+  environmentId: string;
   state: typeof SESSION_STATES[number];
   workspace: {
     root: string;
@@ -492,11 +493,34 @@ export class Environment {
     return new Session(this.config, session);
   }
 
+  async sessions(): Promise<SessionInfo[]> {
+    assertEnvironmentId(this.environmentInfo.id);
+    return parseSessionInfoArray(await getJson(
+      `${this.config.baseUrl}environments/${this.environmentInfo.id}/sessions`,
+    ));
+  }
+
+  async attachSession(sessionId: string): Promise<Session> {
+    assertSessionId(sessionId);
+    const session = parseSessionInfo(await getJson(`${this.config.baseUrl}sessions/${sessionId}`));
+    if (session.environmentId !== this.environmentInfo.id) {
+      throw new Error(`session ${sessionId} belongs to environment ${session.environmentId}, not ${this.environmentInfo.id}`);
+    }
+    return new Session(this.config, session);
+  }
+
   async exportWorkspace(): Promise<WorkspaceArtifact> {
     assertEnvironmentId(this.environmentInfo.id);
     return parseWorkspaceArtifact(await postJson(
       `${this.config.baseUrl}environments/${this.environmentInfo.id}/artifacts/workspace`,
       null,
+    ));
+  }
+
+  async effects(): Promise<StateEffect[]> {
+    assertEnvironmentId(this.environmentInfo.id);
+    return parseStateEffectArray(await getJson(
+      `${this.config.baseUrl}environments/${this.environmentInfo.id}/effects`,
     ));
   }
 
@@ -1929,10 +1953,19 @@ function parseCreateEnvironmentResponse(value: unknown): CreateEnvironmentRespon
   return { environment: parseEnvironmentInfo(requiredField(object, 'environment', 'environment')) };
 }
 
+function parseSessionInfoArray(value: unknown): SessionInfo[] {
+  return jsonArray(value, 'sessions').map(parseSessionInfo);
+}
+
+function parseStateEffectArray(value: unknown): StateEffect[] {
+  return jsonArray(value, 'state effects').map(parseStateEffect);
+}
+
 function parseEnvironmentInfo(value: unknown): EnvironmentInfo {
   const object = jsonObject(value, 'environment');
   rejectUnknownFields(object, [
     'id',
+    'environmentId',
     'state',
     'workspace',
     'policy',
@@ -1963,6 +1996,7 @@ function parseSessionInfo(value: unknown): SessionInfo {
   const object = jsonObject(value, 'session');
   rejectUnknownFields(object, [
     'id',
+    'environmentId',
     'state',
     'workspace',
     'policy',
@@ -1980,6 +2014,7 @@ function parseSessionInfo(value: unknown): SessionInfo {
   const workspace = parseWorkspaceInfo(requiredField(object, 'workspace', 'session workspace'), 'session workspace');
   return {
     id: jsonString(requiredField(object, 'id', 'session id'), 'session id'),
+    environmentId: jsonString(requiredField(object, 'environmentId', 'session environmentId'), 'session environmentId'),
     state: state as typeof SESSION_STATES[number],
     workspace,
     createdAt: jsonString(requiredField(object, 'createdAt', 'session createdAt'), 'session createdAt'),

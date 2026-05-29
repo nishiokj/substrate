@@ -93,6 +93,18 @@ impl HostState {
             .clone())
     }
 
+    pub fn list_environments(&self) -> Result<Vec<Environment>> {
+        let mut inner = self.lock()?;
+        inner.purge_expired_environments()?;
+        let mut environments = inner
+            .environments
+            .values()
+            .map(|record| record.environment.clone())
+            .collect::<Vec<_>>();
+        environments.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(environments)
+    }
+
     pub fn close_environment(&self, environment_id: &str) -> Result<Environment> {
         validate_environment_id(environment_id)?;
         let mut inner = self.lock()?;
@@ -162,6 +174,50 @@ impl HostState {
             session_record.session,
             &environment,
         ))
+    }
+
+    pub fn list_sessions(&self) -> Result<Vec<Session>> {
+        let mut inner = self.lock()?;
+        inner.purge_expired_environments()?;
+        let mut sessions = inner
+            .sessions
+            .values()
+            .filter_map(|session_record| {
+                inner
+                    .environments
+                    .get(&session_record.environment_id)
+                    .map(|environment| {
+                        session_with_environment(
+                            session_record.session.clone(),
+                            &environment.environment,
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        sessions.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(sessions)
+    }
+
+    pub fn list_environment_sessions(&self, environment_id: &str) -> Result<Vec<Session>> {
+        validate_environment_id(environment_id)?;
+        let mut inner = self.lock()?;
+        inner.purge_expired_environments()?;
+        let environment = inner
+            .environments
+            .get(environment_id)
+            .ok_or_else(|| ExecutionerError::SessionNotFound(environment_id.to_string()))?
+            .environment
+            .clone();
+        let mut sessions = inner
+            .sessions
+            .values()
+            .filter(|session_record| session_record.environment_id == environment_id)
+            .map(|session_record| {
+                session_with_environment(session_record.session.clone(), &environment)
+            })
+            .collect::<Vec<_>>();
+        sessions.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(sessions)
     }
 
     pub fn close_session(&self, session_id: &str) -> Result<Session> {
@@ -710,6 +766,7 @@ impl HostInner {
         };
         let session = Session {
             id: session_id.clone(),
+            environment_id: environment.id.clone(),
             state: SessionState::Ready,
             workspace: environment.workspace.clone(),
             policy,
@@ -824,6 +881,7 @@ fn decrement_active_count(counts: &mut HashMap<String, usize>, id: &str) {
 }
 
 fn session_with_environment(mut session: Session, environment: &Environment) -> Session {
+    session.environment_id = environment.id.clone();
     session.workspace = environment.workspace.clone();
     session.expires_at = environment.expires_at.clone();
     session
@@ -832,6 +890,7 @@ fn session_with_environment(mut session: Session, environment: &Environment) -> 
 fn artifact_session_for_environment(environment: &Environment) -> Session {
     Session {
         id: environment.id.clone(),
+        environment_id: environment.id.clone(),
         state: match environment.state {
             EnvironmentState::Starting => SessionState::Starting,
             EnvironmentState::Ready => SessionState::Ready,

@@ -26,7 +26,10 @@ impl HostServer {
     pub fn router(self) -> Router {
         Router::new()
             .route("/health", get(health))
-            .route("/environments", post(create_environment))
+            .route(
+                "/environments",
+                get(list_environments).post(create_environment),
+            )
             .route(
                 "/environments/{environment_id}",
                 get(get_environment).delete(delete_environment),
@@ -37,7 +40,7 @@ impl HostServer {
             )
             .route(
                 "/environments/{environment_id}/sessions",
-                post(create_environment_session),
+                get(list_environment_sessions).post(create_environment_session),
             )
             .route("/environments/{environment_id}/effects", get(get_effects))
             .route(
@@ -48,6 +51,7 @@ impl HostServer {
                 "/sessions/{session_id}",
                 get(get_session).delete(delete_session),
             )
+            .route("/sessions", get(list_sessions))
             .route("/sessions/{session_id}/close", post(close_session))
             .route(
                 "/sessions/{session_id}/invocations",
@@ -74,6 +78,12 @@ async fn create_environment(
 ) -> Result<Json<executioner_core::CreateEnvironmentResponse>, ApiError> {
     let Json(request) = payload.map_err(json_rejection)?;
     Ok(Json(state.create_environment(request)?))
+}
+
+async fn list_environments(
+    State(state): State<HostState>,
+) -> Result<Json<Vec<Environment>>, ApiError> {
+    Ok(Json(state.list_environments()?))
 }
 
 async fn get_environment(
@@ -104,6 +114,17 @@ async fn create_environment_session(
 ) -> Result<Json<executioner_core::CreateSessionResponse>, ApiError> {
     let Json(request) = payload.map_err(json_rejection)?;
     Ok(Json(state.create_session(&environment_id, request)?))
+}
+
+async fn list_environment_sessions(
+    State(state): State<HostState>,
+    Path(environment_id): Path<String>,
+) -> Result<Json<Vec<Session>>, ApiError> {
+    Ok(Json(state.list_environment_sessions(&environment_id)?))
+}
+
+async fn list_sessions(State(state): State<HostState>) -> Result<Json<Vec<Session>>, ApiError> {
+    Ok(Json(state.list_sessions()?))
 }
 
 async fn get_session(
@@ -359,6 +380,46 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn lists_environments_and_environment_sessions_over_http_router() {
+        let temp = TempDir::new().unwrap();
+        let state = HostState::new(temp.path()).unwrap();
+        create_test_session(&state);
+        let app = HostServer::new(state).router();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/environments")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let environments: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(environments[0]["id"], "env");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/environments/env/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let sessions: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(sessions[0]["id"], "sess");
+        assert_eq!(sessions[0]["environmentId"], "env");
     }
 
     #[tokio::test]

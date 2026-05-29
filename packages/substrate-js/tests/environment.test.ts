@@ -241,10 +241,57 @@ describe('Environment file queue validation', () => {
             metadata: {},
           });
         }
+        if (request.method === 'GET' && url.pathname === '/environments/env_shared/sessions') {
+          return Response.json([{
+            id: 'sess_shared',
+            environmentId: 'env_shared',
+            state: 'ready',
+            workspace: {
+              root: '/tmp/workspace',
+              logicalRoot: '/workspace',
+              mode: 'new',
+              fresh: true,
+              managed: true,
+            },
+            createdAt: 'now',
+            metadata: {},
+          }]);
+        }
+        if (request.method === 'GET' && url.pathname === '/sessions/sess_shared') {
+          return Response.json({
+            id: 'sess_shared',
+            environmentId: 'env_shared',
+            state: 'ready',
+            workspace: {
+              root: '/tmp/workspace',
+              logicalRoot: '/workspace',
+              mode: 'new',
+              fresh: true,
+              managed: true,
+            },
+            createdAt: 'now',
+            metadata: {},
+          });
+        }
+        if (request.method === 'GET' && url.pathname === '/environments/env_shared/effects') {
+          return Response.json([{
+            id: 'eff_1',
+            invocationId: 'inv_1',
+            kind: 'file.write',
+            resource: { resourceType: 'file', uri: 'file:///workspace/client-a.txt' },
+            operation: 'create',
+            before: null,
+            after: null,
+            summary: 'created /workspace/client-a.txt',
+            reversible: true,
+            occurredAt: 'now',
+          }]);
+        }
         if (request.method === 'POST' && url.pathname === '/environments/env_shared/sessions') {
           return Response.json({
             session: {
               id: 'sess_shared',
+              environmentId: 'env_shared',
               state: 'ready',
               workspace: {
                 root: '/tmp/workspace',
@@ -283,15 +330,101 @@ describe('Environment file queue validation', () => {
         environmentId: 'env_shared',
       });
       const session = await env.createSession();
+      const sessions = await env.sessions();
+      const recovered = await env.attachSession(session.session.id);
+      const effects = await env.effects();
       const result = await session.submit(tool('Read', { path: 'notes.txt' }));
       const closed = await env.close();
 
+      expect(sessions.map((info) => info.id)).toEqual(['sess_shared']);
+      expect(recovered.session.environmentId).toBe('env_shared');
+      expect(effects.map((effect) => effect.kind)).toEqual(['file.write']);
       expect(result.output).toBe('attached');
       expect(closed.id).toBe('env_shared');
       expect(calls).toEqual([
         'GET /environments/env_shared',
         'POST /environments/env_shared/sessions',
+        'GET /environments/env_shared/sessions',
+        'GET /sessions/sess_shared',
+        'GET /environments/env_shared/effects',
         'POST /sessions/sess_shared/invocations',
+      ]);
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test('attached recovery rejects cross-parent sessions and malformed ledgers', async () => {
+    const calls: string[] = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        const url = new URL(request.url);
+        calls.push(`${request.method} ${url.pathname}`);
+        if (request.method === 'GET' && url.pathname === '/environments/env_owner') {
+          return Response.json({
+            id: 'env_owner',
+            state: 'ready',
+            workspace: {
+              root: '/tmp/owner',
+              logicalRoot: '/workspace',
+              mode: 'new',
+              fresh: true,
+              managed: true,
+            },
+            createdAt: 'now',
+            revision: 0,
+            metadata: {},
+          });
+        }
+        if (request.method === 'GET' && url.pathname === '/sessions/sess_foreign') {
+          return Response.json({
+            id: 'sess_foreign',
+            environmentId: 'env_other',
+            state: 'ready',
+            workspace: {
+              root: '/tmp/other',
+              logicalRoot: '/workspace',
+              mode: 'new',
+              fresh: true,
+              managed: true,
+            },
+            createdAt: 'now',
+            metadata: {},
+          });
+        }
+        if (request.method === 'GET' && url.pathname === '/environments/env_owner/effects') {
+          return Response.json([{
+            id: 'eff_bad',
+            invocationId: 'inv_bad',
+            kind: 'file.write',
+            resource: { resourceType: 'file', uri: 'file:///workspace/bad.txt' },
+            operation: 'teleport',
+            reversible: true,
+            occurredAt: 'now',
+          }]);
+        }
+        if (request.method === 'POST' && url.pathname.startsWith('/sessions/')) {
+          return new Response('unexpected submit', { status: 500 });
+        }
+        return new Response('not found', { status: 404 });
+      },
+    });
+
+    try {
+      const env = await Environment.attach({
+        host: { kind: 'http', baseUrl: `http://127.0.0.1:${server.port}/` },
+        environmentId: 'env_owner',
+      });
+
+      await expect(env.attachSession('sess_foreign')).rejects.toThrow(
+        'belongs to environment env_other, not env_owner',
+      );
+      await expect(env.effects()).rejects.toThrow('unknown state effect operation');
+      expect(calls).toEqual([
+        'GET /environments/env_owner',
+        'GET /sessions/sess_foreign',
+        'GET /environments/env_owner/effects',
       ]);
     } finally {
       server.stop(true);
@@ -2715,6 +2848,7 @@ describe('Environment file queue validation', () => {
           return Response.json({
             session: {
               id: 'sess_swapped_queue_session',
+              environmentId: 'sess_swapped_queue',
               state: 'ready',
               workspace: {
                 root: '/tmp/workspace',

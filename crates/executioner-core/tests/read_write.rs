@@ -1,7 +1,7 @@
 use executioner_core::{
     CreateEnvironmentRequest, CreateSessionRequest, ExecutionPolicy, HostState, NetworkPolicy,
-    ProcessPolicy, ResourceRef, ToolInvocationRequest, ToolResultStatus, WorkspaceArtifact,
-    WorkspaceArtifactEntry, WorkspaceMode, WorkspaceSpec,
+    ProcessPolicy, ResourceRef, SessionState, ToolInvocationRequest, ToolResultStatus,
+    WorkspaceArtifact, WorkspaceArtifactEntry, WorkspaceMode, WorkspaceSpec,
 };
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -207,6 +207,146 @@ fn multiple_sessions_can_share_one_environment_workspace() {
     assert_eq!(read.output, "hello");
     assert_eq!(host.effects(&environment.id).unwrap().len(), 2);
     assert_eq!(host.get_environment(&environment.id).unwrap().revision, 1);
+}
+
+#[test]
+fn registry_views_track_parentage_state_and_effect_isolation() {
+    let temp = TempDir::new().unwrap();
+    let host = HostState::new(temp.path()).unwrap();
+    let env_a = host
+        .create_environment(CreateEnvironmentRequest {
+            environment_id: Some("env_registry_a".to_string()),
+            workspace: WorkspaceSpec {
+                mode: WorkspaceMode::New,
+                root: None,
+                snapshot_ref: None,
+                template_ref: None,
+                mount_as_workspace: true,
+            },
+            policy: policy(),
+            ttl_ms: None,
+            metadata: Map::new(),
+        })
+        .unwrap()
+        .environment;
+    let env_b = host
+        .create_environment(CreateEnvironmentRequest {
+            environment_id: Some("env_registry_b".to_string()),
+            workspace: WorkspaceSpec {
+                mode: WorkspaceMode::New,
+                root: None,
+                snapshot_ref: None,
+                template_ref: None,
+                mount_as_workspace: true,
+            },
+            policy: policy(),
+            ttl_ms: None,
+            metadata: Map::new(),
+        })
+        .unwrap()
+        .environment;
+
+    let sess_a1 = host
+        .create_session(
+            &env_a.id,
+            CreateSessionRequest {
+                session_id: Some("sess_registry_a1".to_string()),
+                policy: None,
+                metadata: Map::new(),
+            },
+        )
+        .unwrap()
+        .session;
+    let sess_a2 = host
+        .create_session(
+            &env_a.id,
+            CreateSessionRequest {
+                session_id: Some("sess_registry_a2".to_string()),
+                policy: None,
+                metadata: Map::new(),
+            },
+        )
+        .unwrap()
+        .session;
+    let sess_b1 = host
+        .create_session(
+            &env_b.id,
+            CreateSessionRequest {
+                session_id: Some("sess_registry_b1".to_string()),
+                policy: None,
+                metadata: Map::new(),
+            },
+        )
+        .unwrap()
+        .session;
+
+    host.execute_invocation(invoke(
+        &sess_a1.id,
+        "Write",
+        json!({ "path": "a.txt", "content": "from a" }),
+    ))
+    .unwrap();
+    host.execute_invocation(invoke(
+        &sess_b1.id,
+        "Write",
+        json!({ "path": "b.txt", "content": "from b" }),
+    ))
+    .unwrap();
+    host.close_session(&sess_a2.id).unwrap();
+
+    let environment_ids = host
+        .list_environments()
+        .unwrap()
+        .into_iter()
+        .map(|environment| environment.id)
+        .collect::<Vec<_>>();
+    assert_eq!(environment_ids, vec!["env_registry_a", "env_registry_b"]);
+
+    let env_a_sessions = host.list_environment_sessions(&env_a.id).unwrap();
+    assert_eq!(
+        env_a_sessions
+            .iter()
+            .map(|session| (
+                session.id.as_str(),
+                session.environment_id.as_str(),
+                &session.state
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("sess_registry_a1", "env_registry_a", &SessionState::Ready),
+            ("sess_registry_a2", "env_registry_a", &SessionState::Closed),
+        ]
+    );
+    assert_eq!(
+        host.list_sessions()
+            .unwrap()
+            .into_iter()
+            .map(|session| (session.id, session.environment_id))
+            .collect::<Vec<_>>(),
+        vec![
+            ("sess_registry_a1".to_string(), "env_registry_a".to_string()),
+            ("sess_registry_a2".to_string(), "env_registry_a".to_string()),
+            ("sess_registry_b1".to_string(), "env_registry_b".to_string()),
+        ]
+    );
+
+    let env_a_effects = host.effects(&env_a.id).unwrap();
+    let env_b_effects = host.effects(&env_b.id).unwrap();
+    assert_eq!(env_a_effects.len(), 1);
+    assert_eq!(env_b_effects.len(), 1);
+    assert_eq!(env_a_effects[0].resource.uri, "file:///workspace/a.txt");
+    assert_eq!(env_b_effects[0].resource.uri, "file:///workspace/b.txt");
+
+    host.destroy_environment(&env_a.id).unwrap();
+    assert!(host.effects(&env_a.id).is_err());
+    assert_eq!(
+        host.list_sessions()
+            .unwrap()
+            .into_iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>(),
+        vec!["sess_registry_b1"]
+    );
 }
 
 #[test]

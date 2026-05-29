@@ -546,6 +546,7 @@ class EnvironmentInfo:
 @dataclass(frozen=True)
 class SessionInfo:
     id: str
+    environmentId: str
     state: SessionState
     workspace: WorkspaceInfo
     createdAt: str
@@ -557,7 +558,7 @@ class SessionInfo:
         value = _json_mapping(value, "session")
         _reject_unknown_fields(
             value,
-            {"id", "state", "workspace", "policy", "createdAt", "expiresAt", "metadata"},
+            {"id", "environmentId", "state", "workspace", "policy", "createdAt", "expiresAt", "metadata"},
             "session",
         )
         if value.get("policy") is not None:
@@ -567,6 +568,7 @@ class SessionInfo:
             raise ValueError(f"unknown session state: {state}")
         return cls(
             id=_json_string(_required_field(value, "id", "session id"), "session id"),
+            environmentId=_json_string(_required_field(value, "environmentId", "session environmentId"), "session environmentId"),
             state=state,  # type: ignore[arg-type]
             workspace=WorkspaceInfo.from_json(_json_mapping(_required_field(value, "workspace", "session workspace"), "session workspace")),
             createdAt=_json_string(_required_field(value, "createdAt", "session createdAt"), "session createdAt"),
@@ -868,6 +870,23 @@ class Environment:
             _create_session(self._config, self._environment.id, policy),
         )
 
+    def sessions(self) -> list[SessionInfo]:
+        _assert_environment_id(self._environment.id)
+        value = _get_json_value(f"{self._config.baseUrl}environments/{self._environment.id}/sessions")
+        return [
+            SessionInfo.from_json(_json_mapping(session, "session"))
+            for session in _json_list(value, "sessions")
+        ]
+
+    def attach_session(self, session_id: str) -> "Session":
+        _assert_session_id(session_id)
+        session = SessionInfo.from_json(_get_json(f"{self._config.baseUrl}sessions/{session_id}"))
+        if session.environmentId != self._environment.id:
+            raise ValueError(
+                f"session {session_id} belongs to environment {session.environmentId}, not {self._environment.id}"
+            )
+        return Session(self._config, session)
+
     def export_workspace(self) -> WorkspaceArtifact:
         _assert_environment_id(self._environment.id)
         artifact = _post_json(
@@ -875,6 +894,14 @@ class Environment:
             None,
         )
         return WorkspaceArtifact.from_json(artifact)
+
+    def effects(self) -> list[StateEffect]:
+        _assert_environment_id(self._environment.id)
+        value = _get_json_value(f"{self._config.baseUrl}environments/{self._environment.id}/effects")
+        return [
+            StateEffect.from_json(_json_mapping(effect, "state effect"))
+            for effect in _json_list(value, "state effects")
+        ]
 
     def materialize_workspace_artifact(
         self,
@@ -1837,7 +1864,11 @@ def _post_json(url: str, body: Any) -> dict[str, Any]:
 
 
 def _get_json(url: str) -> dict[str, Any]:
-    return _request_json(urlrequest.Request(url, method="GET"))
+    return dict(_json_mapping(_get_json_value(url), "host response"))
+
+
+def _get_json_value(url: str) -> Any:
+    return _request_json_value(urlrequest.Request(url, method="GET"))
 
 
 def _delete_json(url: str) -> dict[str, Any]:
@@ -1845,12 +1876,13 @@ def _delete_json(url: str) -> dict[str, Any]:
 
 
 def _request_json(request: urlrequest.Request) -> dict[str, Any]:
+    return dict(_json_mapping(_request_json_value(request), "host response"))
+
+
+def _request_json_value(request: urlrequest.Request) -> Any:
     try:
         with _urlopen_no_redirect(request) as response:
-            return dict(_json_mapping(
-                json.loads(_read_capped_http_json_body(response).decode("utf-8")),
-                "host response",
-            ))
+            return json.loads(_read_capped_http_json_body(response).decode("utf-8"))
     except urlerror.HTTPError as error:
         body = _read_capped_http_error_body(error)
         raise RuntimeError(f"Substrate host returned {error.code}: {body}") from error
@@ -1874,7 +1906,10 @@ def _read_capped_http_json_body(response: Any) -> bytes:
 
 
 def _read_capped_http_error_body(error: urlerror.HTTPError) -> str:
-    body = error.read(_MAX_HTTP_ERROR_BODY_BYTES + 1)
+    try:
+        body = error.read(_MAX_HTTP_ERROR_BODY_BYTES + 1)
+    except OSError as read_error:
+        return f"failed to read error body: {read_error}"
     truncated = len(body) > _MAX_HTTP_ERROR_BODY_BYTES
     body = body[:_MAX_HTTP_ERROR_BODY_BYTES]
     text = body.decode("utf-8", errors="replace")

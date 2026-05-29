@@ -538,6 +538,7 @@ impl ToolCall {
 #[serde(rename_all = "camelCase")]
 pub struct SessionInfo {
     pub id: String,
+    pub environment_id: String,
     pub state: SessionStatus,
     pub workspace: WorkspaceInfo,
     pub created_at: String,
@@ -805,6 +806,33 @@ impl Environment {
         })
     }
 
+    pub async fn sessions(&self) -> Result<Vec<SessionInfo>> {
+        self.host
+            .list_environment_sessions(&self.environment.id)
+            .await
+    }
+
+    pub async fn attach_session(&self, session_id: &str) -> Result<Session> {
+        validate_session_id(session_id)?;
+        let session: SessionInfo = self.host.get_session(session_id).await?.into();
+        if session.environment_id != self.environment.id {
+            return Err(SdkError::Config(format!(
+                "session {session_id} belongs to environment {}, not {}",
+                session.environment_id, self.environment.id
+            )));
+        }
+        Ok(Session {
+            session,
+            transport: self.session_transport.clone(),
+            host: Arc::clone(&self.host),
+            inline_worker: match &self.worker {
+                WorkerDriver::InProcess(worker) => Some(worker.clone()),
+                WorkerDriver::Managed(_) | WorkerDriver::External => None,
+            },
+            submit_timeout: self.submit_timeout,
+        })
+    }
+
     pub async fn close(&self) -> Result<EnvironmentInfo> {
         let worker_result = self.worker.shutdown().await;
 
@@ -843,6 +871,10 @@ impl Environment {
 
     pub async fn export_workspace(&self) -> Result<WorkspaceArtifact> {
         self.host.export_workspace(&self.environment.id).await
+    }
+
+    pub async fn effects(&self) -> Result<Vec<StateEffect>> {
+        self.host.effects(&self.environment.id).await
     }
 
     pub fn materialize_workspace_artifact(
@@ -1221,6 +1253,35 @@ impl HostBackend {
         }
     }
 
+    async fn get_session(&self, session_id: &str) -> Result<CoreSession> {
+        match self {
+            Self::InProcess(state) => state
+                .get_session(session_id)
+                .map_err(|err| SdkError::Host(err.to_string())),
+            Self::Http(host) => host.get_session(session_id).await,
+        }
+    }
+
+    async fn list_environment_sessions(&self, environment_id: &str) -> Result<Vec<SessionInfo>> {
+        match self {
+            Self::InProcess(state) => state
+                .list_environment_sessions(environment_id)
+                .map(|sessions| sessions.into_iter().map(Into::into).collect())
+                .map_err(|err| SdkError::Host(err.to_string())),
+            Self::Http(host) => host.list_environment_sessions(environment_id).await,
+        }
+    }
+
+    async fn effects(&self, environment_id: &str) -> Result<Vec<StateEffect>> {
+        match self {
+            Self::InProcess(state) => state
+                .effects(environment_id)
+                .map(|effects| effects.into_iter().map(Into::into).collect())
+                .map_err(|err| SdkError::Host(err.to_string())),
+            Self::Http(host) => host.effects(environment_id).await,
+        }
+    }
+
     async fn close_environment(&self, environment_id: &str) -> Result<CoreEnvironment> {
         match self {
             Self::InProcess(state) => state
@@ -1310,6 +1371,29 @@ impl HttpHostBackend {
         validate_environment_id(environment_id)?;
         self.get_json(&format!("environments/{environment_id}"))
             .await
+    }
+
+    async fn get_session(&self, session_id: &str) -> Result<CoreSession> {
+        validate_session_id(session_id)?;
+        self.get_json(&format!("sessions/{session_id}")).await
+    }
+
+    async fn list_environment_sessions(&self, environment_id: &str) -> Result<Vec<SessionInfo>> {
+        validate_environment_id(environment_id)?;
+        let sessions = self
+            .get_json::<Vec<CoreSession>>(&format!("environments/{environment_id}/sessions"))
+            .await?;
+        Ok(sessions.into_iter().map(Into::into).collect())
+    }
+
+    async fn effects(&self, environment_id: &str) -> Result<Vec<StateEffect>> {
+        validate_environment_id(environment_id)?;
+        let effects = self
+            .get_json::<Vec<executioner_core::Effect>>(&format!(
+                "environments/{environment_id}/effects"
+            ))
+            .await?;
+        Ok(effects.into_iter().map(Into::into).collect())
     }
 
     async fn close_environment(&self, environment_id: &str) -> Result<CoreEnvironment> {
@@ -1594,6 +1678,7 @@ impl From<CoreSession> for SessionInfo {
     fn from(session: CoreSession) -> Self {
         Self {
             id: session.id,
+            environment_id: session.environment_id,
             state: session.state.into(),
             workspace: WorkspaceInfo {
                 root: session.workspace.root,
@@ -3049,6 +3134,75 @@ mod tests {
             .unwrap();
 
         assert_eq!(read.output, "background worker");
+        let effects = env.effects().await.unwrap();
+        assert!(effects.iter().any(|effect| effect.kind == "file.write"));
+        env.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn environment_recovers_session_and_ledger_after_handle_loss() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let env = Environment::create(
+            Environment::builder()
+                .file_backend(temp.path().join("queue"))
+                .in_process_host(temp.path().join("state"))
+                .new_workspace()
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let session = env.create_session().await.unwrap();
+        let session_id = session.session().id.clone();
+
+        session
+            .submit(
+                ToolCall::json(
+                    "Write",
+                    json!({ "path": "recover.txt", "content": "survived handle loss" }),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        drop(session);
+
+        let recovered = env.attach_session(&session_id).await.unwrap();
+        assert_eq!(recovered.session().environment_id, env.environment().id);
+        assert_eq!(
+            env.sessions()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|session| (session.id, session.environment_id, session.state))
+                .collect::<Vec<_>>(),
+            vec![(
+                session_id.clone(),
+                env.environment().id.clone(),
+                SessionStatus::Ready,
+            )]
+        );
+        let read = recovered
+            .submit(ToolCall::json("Read", json!({ "path": "recover.txt" })).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(read.output, "survived handle loss");
+
+        let effects = env.effects().await.unwrap();
+        assert_eq!(
+            effects
+                .iter()
+                .map(|effect| (effect.kind.as_str(), effect.uri.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("file.write", "file:///workspace/recover.txt"),
+                ("file.read", "file:///workspace/recover.txt"),
+            ]
+        );
+
+        recovered.close().await.unwrap();
+        let closed = env.attach_session(&session_id).await.unwrap();
+        assert_eq!(closed.session().state, SessionStatus::Closed);
         env.close().await.unwrap();
     }
 

@@ -360,6 +360,7 @@ mod tests {
     fn session(root: &Path) -> Session {
         Session {
             id: "sess".to_string(),
+            environment_id: "env".to_string(),
             state: SessionState::Ready,
             workspace: WorkspaceBinding {
                 root: root.to_string_lossy().into_owned(),

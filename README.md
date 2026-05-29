@@ -111,12 +111,19 @@ but do not own environment shutdown. Multiple sessions may share one
 environment; the host serializes tool execution per environment so they share
 one mutable workspace through an ordered stream.
 
+Sessions are durable within the live host: a dropped SDK handle or HTTP
+connection does not close the session. Clients can recover a known
+participation context through the parent environment:
+
 ```py
 env = Environment.attach(
     host={"kind": "http", "baseUrl": "http://127.0.0.1:8765/"},
     environmentId="env_shared",
 )
 session = env.create_session()
+sessions = env.sessions()
+same_session = env.attach_session(session.session.id)
+effects = env.effects()
 ```
 
 Minimal agent-loop shape:
@@ -188,6 +195,21 @@ curl -sS http://127.0.0.1:8765/environments \
 
 The response contains `environment.id`; use that id for session creation,
 workspace export, attach, and explicit environment destruction.
+
+Inspect live environments and their sessions:
+
+```sh
+cargo run -p substrate-runtime -- env list \
+  --host-url http://127.0.0.1:8765
+
+cargo run -p substrate-runtime -- session list \
+  --host-url http://127.0.0.1:8765 \
+  --environment-id env_...
+
+cargo run -p substrate-runtime -- env effects \
+  --host-url http://127.0.0.1:8765 \
+  --environment-id env_...
+```
 
 Create a session attached to that environment:
 

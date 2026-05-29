@@ -13,6 +13,14 @@ sessions and deletes the managed workspace. New sessions are always created
 inside an existing environment; there is no session-create shortcut that
 implicitly creates or owns an environment.
 
+Sessions are durable participation records within a live host, not network
+connections. Dropping an SDK handle, losing an HTTP connection, or closing an
+attached environment handle does not close the remote session. A session remains
+addressable until it is explicitly closed or destroyed, its parent environment
+is closed or destroyed, the environment TTL expires, or the in-memory host
+registry is lost. Every session response includes `environmentId` so clients can
+recover a known session and verify its parent environment.
+
 Multiple clients may create sessions against the same live environment. The
 host treats the environment as the mutable workspace authority: invocations from
 different sessions are accepted concurrently at the API boundary, but tool
@@ -148,13 +156,16 @@ current implementation would execute duplicate side effects.
 
 ```text
 POST   /environments
+GET    /environments
 GET    /environments/:environmentId
 POST   /environments/:environmentId/close
 DELETE /environments/:environmentId
 POST   /environments/:environmentId/sessions
+GET    /environments/:environmentId/sessions
 GET    /environments/:environmentId/effects
 POST   /environments/:environmentId/artifacts/workspace
 
+GET    /sessions
 GET    /sessions/:sessionId
 POST   /sessions/:sessionId/close
 DELETE /sessions/:sessionId

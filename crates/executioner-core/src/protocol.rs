@@ -270,6 +270,7 @@ pub struct Environment {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Session {
     pub id: String,
+    pub environment_id: String,
     pub state: SessionState,
     pub workspace: WorkspaceBinding,
     pub policy: ExecutionPolicy,

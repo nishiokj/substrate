@@ -92,6 +92,7 @@ class EnvironmentTests(unittest.TestCase):
         )
         session_info = SessionInfo.from_json({
             "id": "sess",
+            "environmentId": "env",
             "state": "ready",
             "workspace": {
                 "root": "/tmp/workspace",
@@ -154,6 +155,52 @@ class EnvironmentTests(unittest.TestCase):
                         "metadata": {},
                     })
                     return
+                if self.path == "/environments/env_shared/sessions":
+                    self._json([{
+                        "id": "sess_shared",
+                        "environmentId": "env_shared",
+                        "state": "ready",
+                        "workspace": {
+                            "root": "/tmp/workspace",
+                            "logicalRoot": "/workspace",
+                            "mode": "new",
+                            "fresh": True,
+                            "managed": True,
+                        },
+                        "createdAt": "now",
+                        "metadata": {},
+                    }])
+                    return
+                if self.path == "/sessions/sess_shared":
+                    self._json({
+                        "id": "sess_shared",
+                        "environmentId": "env_shared",
+                        "state": "ready",
+                        "workspace": {
+                            "root": "/tmp/workspace",
+                            "logicalRoot": "/workspace",
+                            "mode": "new",
+                            "fresh": True,
+                            "managed": True,
+                        },
+                        "createdAt": "now",
+                        "metadata": {},
+                    })
+                    return
+                if self.path == "/environments/env_shared/effects":
+                    self._json([{
+                        "id": "eff_1",
+                        "invocationId": "inv_1",
+                        "kind": "file.write",
+                        "resource": {"resourceType": "file", "uri": "file:///workspace/client-a.txt"},
+                        "operation": "create",
+                        "before": None,
+                        "after": None,
+                        "summary": "created /workspace/client-a.txt",
+                        "reversible": True,
+                        "occurredAt": "now",
+                    }])
+                    return
                 self.send_error(404)
 
             def do_POST(self) -> None:
@@ -162,6 +209,7 @@ class EnvironmentTests(unittest.TestCase):
                     self._json({
                         "session": {
                             "id": "sess_shared",
+                            "environmentId": "env_shared",
                             "state": "ready",
                             "workspace": {
                                 "root": "/tmp/workspace",
@@ -214,15 +262,111 @@ class EnvironmentTests(unittest.TestCase):
                 environmentId="env_shared",
             )
             session = env.create_session()
+            sessions = env.sessions()
+            recovered = env.attach_session(session.session.id)
+            effects = env.effects()
             result = session.submit(tool("Read", path="notes.txt"))
             closed = env.close()
 
+            self.assertEqual([info.id for info in sessions], ["sess_shared"])
+            self.assertEqual(recovered.session.environmentId, "env_shared")
+            self.assertEqual([effect.kind for effect in effects], ["file.write"])
             self.assertEqual(result.output, "attached")
             self.assertEqual(closed.id, "env_shared")
             self.assertEqual(calls, [
                 "GET /environments/env_shared",
                 "POST /environments/env_shared/sessions",
+                "GET /environments/env_shared/sessions",
+                "GET /sessions/sess_shared",
+                "GET /environments/env_shared/effects",
                 "POST /sessions/sess_shared/invocations",
+            ])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=1)
+
+    def test_attached_recovery_rejects_cross_parent_sessions_and_malformed_ledgers(self) -> None:
+        calls: list[str] = []
+
+        class RecoveryHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                calls.append(f"GET {self.path}")
+                if self.path == "/environments/env_owner":
+                    self._json({
+                        "id": "env_owner",
+                        "state": "ready",
+                        "workspace": {
+                            "root": "/tmp/owner",
+                            "logicalRoot": "/workspace",
+                            "mode": "new",
+                            "fresh": True,
+                            "managed": True,
+                        },
+                        "createdAt": "now",
+                        "revision": 0,
+                        "metadata": {},
+                    })
+                    return
+                if self.path == "/sessions/sess_foreign":
+                    self._json({
+                        "id": "sess_foreign",
+                        "environmentId": "env_other",
+                        "state": "ready",
+                        "workspace": {
+                            "root": "/tmp/other",
+                            "logicalRoot": "/workspace",
+                            "mode": "new",
+                            "fresh": True,
+                            "managed": True,
+                        },
+                        "createdAt": "now",
+                        "metadata": {},
+                    })
+                    return
+                if self.path == "/environments/env_owner/effects":
+                    self._json([{
+                        "id": "eff_bad",
+                        "invocationId": "inv_bad",
+                        "kind": "file.write",
+                        "resource": {"resourceType": "file", "uri": "file:///workspace/bad.txt"},
+                        "operation": "teleport",
+                        "reversible": True,
+                        "occurredAt": "now",
+                    }])
+                    return
+                self.send_error(404)
+
+            def do_POST(self) -> None:
+                calls.append(f"POST {self.path}")
+                self.send_error(500)
+
+            def _json(self, body: object) -> None:
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(body).encode("utf-8"))
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), RecoveryHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            env = Environment.attach(
+                host={"kind": "http", "baseUrl": f"http://127.0.0.1:{server.server_address[1]}/"},
+                environmentId="env_owner",
+            )
+
+            with self.assertRaisesRegex(ValueError, "belongs to environment env_other, not env_owner"):
+                env.attach_session("sess_foreign")
+            with self.assertRaisesRegex(ValueError, "unknown state effect operation"):
+                env.effects()
+            self.assertEqual(calls, [
+                "GET /environments/env_owner",
+                "GET /sessions/sess_foreign",
+                "GET /environments/env_owner/effects",
             ])
         finally:
             server.shutdown()
@@ -883,6 +1027,7 @@ class EnvironmentTests(unittest.TestCase):
             )
             session = SessionInfo(
                 id="sess_bad_options",
+                environmentId="env",
                 state="ready",
                 workspace=WorkspaceInfo(
                     root="/workspace",
@@ -1017,6 +1162,7 @@ class EnvironmentTests(unittest.TestCase):
             )
             session = SessionInfo(
                 id="sess_swapped_queue",
+                environmentId="env",
                 state="ready",
                 workspace=WorkspaceInfo(
                     root="/workspace",
@@ -1461,6 +1607,7 @@ class EnvironmentTests(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "workspace fresh"):
             SessionInfo.from_json({
                 "id": "sess",
+                "environmentId": "env",
                 "state": "ready",
                 "workspace": {
                     "root": "/tmp/workspace",
@@ -1477,6 +1624,7 @@ class EnvironmentTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "workspace root is required"):
             SessionInfo.from_json({
                 "id": "sess",
+                "environmentId": "env",
                 "state": "ready",
                 "workspace": {
                     "logicalRoot": "/workspace",
@@ -1491,6 +1639,7 @@ class EnvironmentTests(unittest.TestCase):
     def test_session_parser_rejects_unknown_fields(self) -> None:
         session = {
             "id": "sess",
+            "environmentId": "env",
             "state": "ready",
             "workspace": {
                 "root": "/tmp/workspace",
@@ -1527,6 +1676,7 @@ class EnvironmentTests(unittest.TestCase):
     def test_session_parser_rejects_unknown_enum_values(self) -> None:
         session = {
             "id": "sess",
+            "environmentId": "env",
             "state": "ready",
             "workspace": {
                 "root": "/tmp/workspace",
@@ -2448,6 +2598,7 @@ class EnvironmentTests(unittest.TestCase):
         )
         session = SessionInfo(
             id="sess_close_order",
+            environmentId="env",
             state="ready",
             workspace=WorkspaceInfo(
                 root="/workspace",
@@ -2513,6 +2664,7 @@ class EnvironmentTests(unittest.TestCase):
             )
             session = SessionInfo(
                 id="sess_close_failure",
+                environmentId="env",
                 state="ready",
                 workspace=WorkspaceInfo(
                     root="/workspace",
@@ -2571,6 +2723,7 @@ class EnvironmentTests(unittest.TestCase):
             )
             session = SessionInfo(
                 id="sess_queue_preserve",
+                environmentId="env",
                 state="ready",
                 workspace=WorkspaceInfo(
                     root="/workspace",
@@ -2664,6 +2817,7 @@ class EnvironmentTests(unittest.TestCase):
             )
             session = SessionInfo(
                 id="sess_state_preserve",
+                environmentId="env",
                 state="ready",
                 workspace=WorkspaceInfo(
                     root="/workspace",

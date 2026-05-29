@@ -43,7 +43,9 @@ await env.close();
 
 To join an environment created by another process or client, attach to it. An
 attached handle can create sessions and submit tool calls, but it does not close
-or destroy the environment when the handle is closed:
+or destroy the environment when the handle is closed. Sessions remain durable
+within the live host until explicitly closed/destroyed or until their parent
+environment is closed/destroyed:
 
 ```ts
 const env = await Environment.attach({
@@ -52,6 +54,9 @@ const env = await Environment.attach({
 });
 
 const session = await env.createSession();
+const sessions = await env.sessions();
+const recovered = await env.attachSession(session.session.id);
+const effects = await env.effects();
 await session.write('client-a.txt', 'hello');
 await env.close();
 ```

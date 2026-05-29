@@ -58,6 +58,18 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum SessionCommand {
+    List {
+        #[arg(long, default_value = "http://127.0.0.1:8765/")]
+        host_url: String,
+        #[arg(long)]
+        environment_id: Option<String>,
+    },
+    Get {
+        #[arg(long, default_value = "http://127.0.0.1:8765/")]
+        host_url: String,
+        #[arg(long)]
+        session_id: String,
+    },
     Create {
         #[arg(long, default_value = "http://127.0.0.1:8765/")]
         host_url: String,
@@ -96,6 +108,22 @@ enum WorkerCommand {
 
 #[derive(Debug, Subcommand)]
 enum EnvCommand {
+    List {
+        #[arg(long, default_value = "http://127.0.0.1:8765/")]
+        host_url: String,
+    },
+    Get {
+        #[arg(long, default_value = "http://127.0.0.1:8765/")]
+        host_url: String,
+        #[arg(long)]
+        environment_id: String,
+    },
+    Effects {
+        #[arg(long, default_value = "http://127.0.0.1:8765/")]
+        host_url: String,
+        #[arg(long)]
+        environment_id: String,
+    },
     Smoke {
         #[arg(long, default_value = "/tmp/executioner-env-queue")]
         queue_dir: PathBuf,
@@ -115,6 +143,33 @@ async fn main() -> anyhow::Result<()> {
             serve(state, addr).await?;
         }
         Command::Session { command } => match command {
+            SessionCommand::List {
+                host_url,
+                environment_id,
+            } => {
+                let base_url = normalize_url(&host_url)?;
+                let response: Value = if let Some(environment_id) = environment_id {
+                    validate_session_id(&environment_id)?;
+                    get_json(
+                        &base_url,
+                        &format!("environments/{environment_id}/sessions"),
+                    )
+                    .await?
+                } else {
+                    get_json(&base_url, "sessions").await?
+                };
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            }
+            SessionCommand::Get {
+                host_url,
+                session_id,
+            } => {
+                validate_session_id(&session_id)?;
+                let base_url = normalize_url(&host_url)?;
+                let response: Value =
+                    get_json(&base_url, &format!("sessions/{session_id}")).await?;
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            }
             SessionCommand::Create {
                 host_url,
                 environment_id,
@@ -205,6 +260,31 @@ async fn main() -> anyhow::Result<()> {
             }
         },
         Command::Env { command } => match command {
+            EnvCommand::List { host_url } => {
+                let base_url = normalize_url(&host_url)?;
+                let response: Value = get_json(&base_url, "environments").await?;
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            }
+            EnvCommand::Get {
+                host_url,
+                environment_id,
+            } => {
+                validate_session_id(&environment_id)?;
+                let base_url = normalize_url(&host_url)?;
+                let response: Value =
+                    get_json(&base_url, &format!("environments/{environment_id}")).await?;
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            }
+            EnvCommand::Effects {
+                host_url,
+                environment_id,
+            } => {
+                validate_session_id(&environment_id)?;
+                let base_url = normalize_url(&host_url)?;
+                let response: Value =
+                    get_json(&base_url, &format!("environments/{environment_id}/effects")).await?;
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            }
             EnvCommand::Smoke {
                 queue_dir,
                 state_dir,
@@ -293,6 +373,11 @@ async fn post_json<T: Serialize>(base_url: &Url, path: &str, body: &T) -> anyhow
 
 async fn post_empty(base_url: &Url, path: &str) -> anyhow::Result<Value> {
     let response = http_client()?.post(base_url.join(path)?).send().await?;
+    read_capped_json_response(response, MAX_HTTP_JSON_BODY_BYTES).await
+}
+
+async fn get_json(base_url: &Url, path: &str) -> anyhow::Result<Value> {
+    let response = http_client()?.get(base_url.join(path)?).send().await?;
     read_capped_json_response(response, MAX_HTTP_JSON_BODY_BYTES).await
 }
 
