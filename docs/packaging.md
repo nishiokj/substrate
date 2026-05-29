@@ -87,6 +87,27 @@ pip install substrate-sdk
 This keeps Rust out of SDK installation: users receive a prebuilt
 binary, not a local compile.
 
+## Runtime Wheel Builds
+
+Build the Python runtime wheel from a compiled release binary:
+
+```sh
+python3 -m pip install build twine
+scripts/build_runtime_python_wheel.sh
+python3 -m twine check dist/substrate_runtime-*.whl
+```
+
+The script builds `target/release/substrate-runtime`, stages a temporary copy of
+`packages/substrate-runtime-python`, copies the release binary into the staged
+package, and writes the wheel to `dist/`. It does not mutate the checked-in
+development binary under `packages/substrate-runtime-python/src`.
+
+Linux distribution wheels should be built by the `Distributions` GitHub Actions
+workflow. That workflow runs inside the `manylinux2014_x86_64` container and
+sets the wheel platform tag to
+`manylinux_2_17_x86_64.manylinux2014_x86_64`, producing an artifact suitable for
+Linux x86_64 installs from PyPI or another wheel index.
+
 ## Validation
 
 Before publishing a release, validate the artifacts themselves:

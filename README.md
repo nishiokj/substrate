@@ -18,14 +18,15 @@ The agent adapter is a consumer of this protocol, not the owner of it.
 
 ## Workspace
 
-- `crates/runtime-core`: protocol types, environment/session lifecycle,
+- `crates/executioner-core`: protocol types, environment/session lifecycle,
   workspace path resolution, effect ledger, and the built-in tool
   implementations.
-- `crates/runtime-host`: HTTP host server over `substrate-runtime-core`.
-- `crates/runtime-worker`: broker/host abstractions, reusable file-backed
+- `crates/executioner-host`: HTTP host server over `executioner-core`.
+- `crates/executioner-worker`: broker/host abstractions, reusable file-backed
   broker, and pull worker loops.
-- `crates/runtime-cli`: CLI for starting a host, calling a host, and running
+- `crates/executioner-cli`: CLI for starting a host, calling a host, and running
   a file-backed worker once.
+- `crates/executioner-sdk`: Rust SDK facade over local and remote hosts.
 - `packages/substrate-js`: TypeScript SDK that manages environment, session,
   worker, and file-backed queue lifecycle.
 - `packages/substrate-python`: Python SDK that manages environment, session,

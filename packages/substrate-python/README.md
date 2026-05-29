@@ -39,8 +39,9 @@ with Environment.create(workspace={"kind": "new"}, policy={"process": {"allowExe
 To join an environment created by another process or client, attach to it. An
 attached handle can create sessions and submit tool calls, but it does not close
 or destroy the environment when the handle is closed. Sessions remain durable
-within the live host until explicitly closed/destroyed or until their parent
-environment is closed/destroyed:
+within the live host until explicitly closed/destroyed, their parent environment
+is closed/destroyed, the parent environment TTL expires, or the host's in-memory
+registry is lost:
 
 ```py
 env = Environment.attach(

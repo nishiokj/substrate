@@ -1,3 +1,5 @@
+import os
+
 from setuptools import Distribution, setup
 from wheel.bdist_wheel import bdist_wheel
 
@@ -15,6 +17,7 @@ class RuntimeWheel(bdist_wheel):
 
     def get_tag(self) -> tuple[str, str, str]:
         _python, _abi, platform = super().get_tag()
+        platform = os.environ.get("SUBSTRATE_RUNTIME_PLATFORM_TAG", platform)
         return ("py3", "none", platform)
 
 

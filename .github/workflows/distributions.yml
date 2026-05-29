@@ -1,0 +1,46 @@
+name: Distributions
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  linux-runtime-wheel:
+    name: Linux runtime wheel
+    runs-on: ubuntu-latest
+    container: quay.io/pypa/manylinux2014_x86_64
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o rustup-init.sh
+          sh rustup-init.sh -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install Python build tooling
+        run: /opt/python/cp312-cp312/bin/python -m pip install build twine
+
+      - name: Build Linux runtime wheel
+        run: scripts/build_runtime_python_wheel.sh
+        env:
+          PYTHON_BIN: /opt/python/cp312-cp312/bin/python
+          SUBSTRATE_RUNTIME_PLATFORM_TAG: manylinux_2_17_x86_64.manylinux2014_x86_64
+
+      - name: Check runtime wheel
+        run: /opt/python/cp312-cp312/bin/python -m twine check dist/*
+
+      - name: Upload runtime wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: substrate-runtime-linux-x86_64-wheel
+          path: dist/substrate_runtime-*.whl
+          if-no-files-found: error
+

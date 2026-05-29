@@ -116,7 +116,7 @@ one ordered stream.
 An external worker can also be started with the CLI:
 
 ```sh
-executioner worker run \
+substrate-runtime worker run \
     --host-url http://127.0.0.1:8765 \
     --queue-dir /path/to/queue \
     --id agent-worker
@@ -141,7 +141,7 @@ Agent loop -> event broker -> Executioner worker -> Executioner host
 The worker can be spawned by the CLI:
 
 ```sh
-executioner worker run --host-url http://host:8765 --queue-dir /path/to/queue
+substrate-runtime worker run --host-url http://host:8765 --queue-dir /path/to/queue
 ```
 
 It can also be embedded by constructing `executioner_worker::Worker` with any
